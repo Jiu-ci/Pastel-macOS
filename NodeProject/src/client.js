@@ -1,5 +1,5 @@
 import plist from 'plist';
-import {storeLogin, curlRequest, parsePlistLoose, STORE_USER_AGENT, cleanup, fetchStoreURLBag} from './gsa.js';
+import {storeLogin, curlRequest, parsePlistLoose, STORE_USER_AGENT, cleanup, fetchStoreURLBag, storeResponseDiagnostic} from './gsa.js';
 import {recoverRedownload, shouldTryRedownload} from './download-recovery.js';
 import {getDeviceGuid} from './device.js';
 import {t} from './i18n.js';
@@ -35,7 +35,6 @@ const AUTH_FAILURE_TYPES = new Set(['-5000', '1008', '2002', '2034', '2042']);
 
 export function isAuthFailureResponse(failureType, customerMessage, statusCode = 200) {
     return statusCode === 401
-        || statusCode === 403
         || AUTH_FAILURE_TYPES.has(String(failureType || ''))
         || isPasswordTokenExpiredMessage(customerMessage);
 }
@@ -107,6 +106,36 @@ const _endpoints = {
     },
 };
 
+export function parseStoreResponse(res, {prefix = '', url = '', redownload = false} = {}) {
+    let parsed = null;
+    // Do not feed HTML/error pages to the permissive plist parser. Its parser
+    // warnings can otherwise leak raw response fragments into the task log.
+    const xml = res.body?.toString('utf8').trim() || '';
+    if (/<plist[\s>]|^<dict[\s>]/i.test(xml) && !/<html[\s>]/i.test(xml)) {
+        try { parsed = parsePlistLoose(res.body, t('ctx_resp')); } catch { /* invalid plist */ }
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) parsed = null;
+    const diagnostic = storeResponseDiagnostic(res, url, parsed);
+    console.log(diagnostic);
+    if (isAuthFailureResponse(parsed?.failureType, parsed?.customerMessage, res.status)) {
+        const error = tokenExpiredError();
+        error.message += ` (${diagnostic})`;
+        throw error;
+    }
+    if (redownload && res.status === 500 && res.body.length === 0) {
+        const error = new Error(`Empty Apple redownload response (${diagnostic})`);
+        error.code = 'EMPTY_REDOWNLOAD_RESPONSE';
+        throw error;
+    }
+    if (!parsed || ((res.status < 200 || res.status >= 300) && !parsed.failureType && !parsed.customerMessage)) {
+        const error = new Error(`${prefix}${t('store_http_rejected', {status: res.status})} (${diagnostic})`);
+        error.code = 'STORE_HTTP_REJECTED';
+        error.httpStatus = res.status;
+        throw error;
+    }
+    return {...parsed, _httpStatus: res.status};
+}
+
 class Store {
     static get guid() {
         return getDeviceGuid();
@@ -126,6 +155,11 @@ class Store {
             if (error.code === 'AUTH_OR_2FA') {
                 const e = new Error(t('login_auth_or_2fa'));
                 e.code = 'AUTH_OR_2FA';
+                throw e;
+            }
+            if (error.code === 'AUTH_CODE_REJECTED') {
+                const e = new Error(`[AUTH] ${t('login_auth_failed', {msg})}`);
+                e.code = 'AUTH_CODE_REJECTED';
                 throw e;
             }
             // 2FA 检测用稳定的 error.code（不依赖文案语言）；保留中文 includes 作为兜底。
@@ -152,19 +186,7 @@ class Store {
             e.code = 'STORE_FAIL';
             throw e;
         }
-        if (isAuthFailureResponse('', '', res.status)) throw tokenExpiredError();
-        if (redownload && res.status === 500 && res.body.length === 0) {
-            const error = new Error('Empty Apple redownload response');
-            error.code = 'EMPTY_REDOWNLOAD_RESPONSE';
-            throw error;
-        }
-        try {
-            return {...parsePlistLoose(res.body, t('ctx_resp')), _httpStatus: res.status};
-        } catch (error) {
-            const e = new Error(`${prefix}${t('bad_format_suffix', {message: error.message})}`);
-            e.code = 'STORE_FAIL';
-            throw e;
-        }
+        return parseStoreResponse(res, {prefix, url, redownload});
     }
 
     static async AppInfo(appIdentifier, appVerId, authContext, {listVersions = false} = {}) {

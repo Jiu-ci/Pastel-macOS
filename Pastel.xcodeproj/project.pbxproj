@@ -7,9 +7,9 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		1A0000000000000000000033 /* AppearanceCompatibility.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000034 /* AppearanceCompatibility.swift */; };
 		1A000000000000000000000A /* PastelApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000007 /* PastelApp.swift */; };
 		1A0000000000000000000020 /* Localizable.xcstrings in Resources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000021 /* Localizable.xcstrings */; };
-		1A0000000000000000000024 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = 1A0000000000000000000023 /* Sparkle */; };
 		1A000000000000000000002A /* AccountFeatureState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000025 /* AccountFeatureState.swift */; };
 		1A000000000000000000002B /* SearchFeatureState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000026 /* SearchFeatureState.swift */; };
 		1A000000000000000000002C /* VersionHistoryFeatureState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000027 /* VersionHistoryFeatureState.swift */; };
@@ -20,6 +20,7 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		1A0000000000000000000034 /* AppearanceCompatibility.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppearanceCompatibility.swift; sourceTree = "<group>"; };
 		1A0000000000000000000003 /* Pastel.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Pastel.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		1A0000000000000000000007 /* PastelApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PastelApp.swift; sourceTree = "<group>"; };
 		1A0000000000000000000008 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
@@ -38,7 +39,6 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				1A0000000000000000000024 /* Sparkle in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -66,6 +66,7 @@
 			isa = PBXGroup;
 			children = (
 				1A0000000000000000000007 /* PastelApp.swift */,
+				1A0000000000000000000034 /* AppearanceCompatibility.swift */,
 				1A0000000000000000000025 /* AccountFeatureState.swift */,
 				1A0000000000000000000026 /* SearchFeatureState.swift */,
 				1A0000000000000000000027 /* VersionHistoryFeatureState.swift */,
@@ -96,7 +97,6 @@
 			);
 			name = "Pastel";
 			packageProductDependencies = (
-				1A0000000000000000000023 /* Sparkle */,
 			);
 			productName = Pastel;
 			productReference = 1A0000000000000000000003 /* Pastel.app */;
@@ -132,7 +132,6 @@
 			);
 			mainGroup = 1A0000000000000000000004;
 			packageReferences = (
-				1A0000000000000000000022 /* XCRemoteSwiftPackageReference "Sparkle" */,
 			);
 			productRefGroup = 1A0000000000000000000005 /* Products */;
 			projectDirPath = "";
@@ -185,6 +184,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				1A000000000000000000000A /* PastelApp.swift in Sources */,
+				1A0000000000000000000033 /* AppearanceCompatibility.swift in Sources */,
 				1A000000000000000000002A /* AccountFeatureState.swift in Sources */,
 				1A000000000000000000002B /* SearchFeatureState.swift in Sources */,
 				1A000000000000000000002C /* VersionHistoryFeatureState.swift in Sources */,
@@ -207,7 +207,7 @@
 				ENABLE_TESTABILITY = YES;
 				GCC_NO_COMMON_BLOCKS = YES;
 				GCC_OPTIMIZATION_LEVEL = 0;
-				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				ONLY_ACTIVE_ARCH = YES;
 				SDKROOT = macosx;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
@@ -225,7 +225,7 @@
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				GCC_NO_COMMON_BLOCKS = YES;
-				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				SDKROOT = macosx;
 				SWIFT_OPTIMIZATION_LEVEL = "-O";
 			};
@@ -239,7 +239,7 @@
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 2026092903;
+				CURRENT_PROJECT_VERSION = 2026102801;
 				ENABLE_HARDENED_RUNTIME = NO;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Pastel/Info.plist;
@@ -247,7 +247,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 20260929.2;
+				MARKETING_VERSION = 20261028.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.allenmiao.ipahistorydownload;
 				PRODUCT_NAME = "Pastel";
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -264,7 +264,7 @@
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 2026092903;
+				CURRENT_PROJECT_VERSION = 2026102801;
 				ENABLE_HARDENED_RUNTIME = NO;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = Pastel/Info.plist;
@@ -272,7 +272,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 20260929.2;
+				MARKETING_VERSION = 20261028.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.allenmiao.ipahistorydownload;
 				PRODUCT_NAME = "Pastel";
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -304,24 +304,6 @@
 		};
 /* End XCConfigurationList section */
 
-/* Begin XCRemoteSwiftPackageReference section */
-		1A0000000000000000000022 /* XCRemoteSwiftPackageReference "Sparkle" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/sparkle-project/Sparkle";
-			requirement = {
-				kind = upToNextMajorVersion;
-				minimumVersion = 2.9.3;
-			};
-		};
-/* End XCRemoteSwiftPackageReference section */
-
-/* Begin XCSwiftPackageProductDependency section */
-		1A0000000000000000000023 /* Sparkle */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = 1A0000000000000000000022 /* XCRemoteSwiftPackageReference "Sparkle" */;
-			productName = Sparkle;
-		};
-/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 1A0000000000000000000001 /* Project object */;
 }

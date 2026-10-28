@@ -191,7 +191,7 @@ export class Ipa {
     }
 
     async writeEncryptedSession(session) {
-        if (!this.sessionEncryptionKey) return;
+        if (!this.sessionEncryptionKey) throw new Error('Missing session encryption key');
         const envelope = sealSession(session, this.sessionEncryptionKey);
         await fsPromises.mkdir(path.dirname(this.sessionFile), {recursive: true, mode: 0o700});
         const temporaryFile = `${this.sessionFile}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
@@ -230,12 +230,23 @@ export class Ipa {
             }
         }
 
+        // A failed forced login must not leave the previous token eligible for
+        // reuse by the next download process. Keep its cookies only in memory
+        // for this authentication attempt.
+        await this.clearSession();
+        this.user = null;
+        this.auth = {};
         const user = await Store.login(this.creds.APPLE_ID, this.creds.PASSWORD, this.creds.CODE, previousSession);
-        console.log(t('login_success', {name: `${user.accountInfo.address.firstName} ${user.accountInfo.address.lastName}`}));
+        try {
+            await this.saveSession(user);
+        } catch (error) {
+            const failure = new Error(t('save_session_failed', {message: error.message}));
+            failure.code = 'SESSION_SAVE_FAILED';
+            throw failure;
+        }
         this.applyUser(user, false);
-        await this.saveSession(user).catch(error => {
-            console.log(t('save_session_failed', {message: error.message}));
-        });
+        const address = user.accountInfo?.address || {};
+        console.log(t('login_success', {name: `${address.firstName || ''} ${address.lastName || ''}`.trim()}));
     }
 
     async persistCurrentSession() {
@@ -428,7 +439,7 @@ export class Ipa {
             const code = error.code;
             const sessionMayBeExpired = this.usedCachedSession
                 && (code === 'TOKEN_EXPIRED'
-                    || /401|403|Your password has changed\.?|password token is expired|token|session|authenticate|authorization|Sign In to the iTunes Store/i.test(message))
+                    || (!code && /Your password has changed\.?|password token is expired|Sign In to the iTunes Store/i.test(message)))
                 && !/License not found|已拥有|already|not found/i.test(message);
             if (!sessionMayBeExpired) throw error;
 

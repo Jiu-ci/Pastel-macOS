@@ -3,16 +3,20 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import plist from 'plist';
 import {appInfoFailureCode, isAuthFailureResponse, purchaseSuccessKind} from '../src/client.js';
+import {recoverRedownload} from '../src/download-recovery.js';
 import {
     buildLoginBody,
     buildSignedAuthenticationHeaders,
     parseLoginResponse,
+    shouldRetryAuthenticationRequest,
     shouldRetryWithLegacyAuthenticate,
 } from '../src/gsa.js';
 
 test('recognizes StoreServices HTTP authentication failures', () => {
     assert.equal(isAuthFailureResponse('', '', 401), true);
-    assert.equal(isAuthFailureResponse('', '', 403), true);
+    // Apple also uses bare 403 for download-dispatch rejections that are not
+    // expired sessions; those must not trigger an automatic relogin.
+    assert.equal(isAuthFailureResponse('', '', 403), false);
     assert.equal(isAuthFailureResponse('', '', 500), false);
 });
 
@@ -27,6 +31,18 @@ test('recognizes legacy password-token messages', () => {
     assert.equal(isAuthFailureResponse('', 'Your password has changed.', 200), true);
     assert.equal(isAuthFailureResponse('', 'password token is expired', 200), true);
     assert.equal(isAuthFailureResponse('', 'temporarily unavailable', 200), false);
+});
+
+test('preserves a bare redownload 403 without inventing a license failure', async () => {
+    const error = Object.assign(new Error('HTTP 403'), {
+        code: 'STORE_HTTP_REJECTED', httpStatus: 403,
+    });
+    await assert.rejects(recoverRedownload({
+        request: async () => { throw error; },
+        loadBag: async () => { throw new Error('unexpected fallback'); },
+        appIdentifier: '414245413',
+        versionID: '890808313',
+    }), actual => actual === error);
 });
 
 test('does not mistake Apple busy responses for a missing license', () => {
@@ -134,4 +150,23 @@ test('does not misclassify Apple Configurator bad-login response as definite 2FA
 
     assert.equal(result.error?.code, 'AUTH_OR_2FA');
     assert.notEqual(result.error?.code, 'NEEDS_2FA');
+});
+
+test('keeps a rejected verification code actionable instead of reporting token exchange failure', () => {
+    const body = Buffer.from(plist.build({
+        failureType: '',
+        customerMessage: 'MZFinance.BadLogin.Configurator_message',
+        'm-allowed': false,
+    }));
+    const result = parseLoginResponse({status: 200, headers: '', body}, 1, '123456');
+
+    assert.equal(result.error?.code, 'AUTH_CODE_REJECTED');
+    assert.match(result.error?.message || '', /Apple/);
+});
+
+test('does not wait through native retries when a legacy authentication fallback is available', () => {
+    assert.equal(shouldRetryAuthenticationRequest('https://auth.itunes.apple.com/auth/v1/native/fast/', 204), false);
+    assert.equal(shouldRetryAuthenticationRequest('https://auth.itunes.apple.com/auth/v1/native/fast/', 404), false);
+    assert.equal(shouldRetryAuthenticationRequest('https://auth.itunes.apple.com/auth/v1/native/fast/', 429), true);
+    assert.equal(shouldRetryAuthenticationRequest('https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate', 204), true);
 });

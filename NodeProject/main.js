@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import {cleanup} from './src/gsa.js';
 import {Ipa} from './src/ipa.js';
 import {featuredApps, fetchVersions, lookupApp, searchApps} from './src/catalog.js';
 import {readCredentials} from './src/credentials.js';
@@ -103,7 +104,7 @@ async function runCommand(command, args) {
             await app.login({force: process.env.IPA_FORCE_LOGIN === '1'});
             const storefront = String(app.user?.authHeaders?.['X-Apple-Store-Front'] || '').split('-')[0];
             const addr = app.user?.accountInfo?.address || {};
-            printJSON({ok: true, storefront, firstName: addr.firstName || '', lastName: addr.lastName || ''});
+            printJSON({kind: 'loginValidation', ok: true, sessionSaved: true, storefront, firstName: addr.firstName || '', lastName: addr.lastName || ''});
             console.log(t('all_done'));
             return;
         }
@@ -130,6 +131,7 @@ async function runCommand(command, args) {
         console.error(err.message || String(err));
         process.exitCode = 1;
     } finally {
+        cleanup();
         // StoreServices/curl/HTTP 依赖偶尔会留下活跃句柄。业务和输出都已完成后
         // 明确结束 CLI，避免 macOS 端永远等不到 Process.terminationHandler。
         const exitCode = process.exitCode || 0;

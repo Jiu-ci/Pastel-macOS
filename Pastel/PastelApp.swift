@@ -5,10 +5,11 @@ import Darwin
 import ObjectiveC
 import Observation
 import Security
-import Sparkle
 import SwiftUI
 
 private let appDisplayName = "Pastel"
+private let projectURL = "https://github.com/Jiu-ci/Pastel-macOS"
+private let upstreamProjectURL = "https://github.com/EEliberto/Pastel-macOS"
 
 private func copyToPasteboard(_ string: String) {
     let value = string.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -207,10 +208,14 @@ enum CredentialVaultError: LocalizedError {
     }
 }
 
+@MainActor
 private enum DeviceGUIDStore {
     private static let service = "com.allenmiao.ipahistorydownload.device-guid"
     private static let account = "DeviceIdentifier"
     private static let hexCharacterSet = CharacterSet(charactersIn: "0123456789abcdefABCDEF")
+    // SwiftUI can recreate settings views frequently. Read the protected item
+    // once per process, and reuse it for settings, login and download jobs.
+    private static var cachedIdentifier: String?
     private static let invalidIdentifiers: Set<String> = [
         "000000000000",
         "020000000000",
@@ -218,7 +223,9 @@ private enum DeviceGUIDStore {
     ]
 
     static func current() throws -> String {
-        if let saved = load() {
+        if let cachedIdentifier { return cachedIdentifier }
+        if let saved = try load() {
+            cachedIdentifier = saved
             return saved
         }
 
@@ -227,18 +234,24 @@ private enum DeviceGUIDStore {
         }
 
         try save(value)
+        cachedIdentifier = value
         return value
     }
 
-    private static func load() -> String? {
+    private static func load() throws -> String? {
         var query = baseQuery
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
 
         var result: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess,
-              let data = result as? Data,
+        if status == errSecItemNotFound { return nil }
+        // A denied/cancelled read is not a missing item. Do not immediately
+        // attempt an update, which can show another authorization dialog.
+        guard status == errSecSuccess else {
+            throw CredentialVaultError.keychainOperationFailed("读取设备标识", status)
+        }
+        guard let data = result as? Data,
               let value = String(data: data, encoding: .utf8)
         else {
             return nil
@@ -247,7 +260,10 @@ private enum DeviceGUIDStore {
             // Pastel 20260906 could persist macOS's privacy placeholder
             // 02:00:00:00:00:00. Remove it so the corrected system lookup can
             // replace the Keychain item on this launch.
-            SecItemDelete(baseQuery as CFDictionary)
+            let deleteStatus = SecItemDelete(baseQuery as CFDictionary)
+            guard deleteStatus == errSecSuccess || deleteStatus == errSecItemNotFound else {
+                throw CredentialVaultError.keychainOperationFailed("更新设备标识", deleteStatus)
+            }
             return nil
         }
         return normalized
@@ -1118,8 +1134,8 @@ final class AccountStore {
 
     private var process: Process?
     private var pipes: (Pipe, Pipe)?
-    private var validationLog = ""
     private var pending: (email: String, password: String, editingID: UUID?, country: String)?
+    private var validationGeneration: UInt64 = 0
 
     var selectedAccount: StoredAccount? { accounts.first { $0.id == selectedAccountID } }
     var hasSelectedLogin: Bool {
@@ -1213,6 +1229,7 @@ final class AccountStore {
     }
 
     func validate(email: String, password: String, editingID: UUID?, fallbackCountry: String) {
+        guard !isValidating else { return }
         let cleanEmail = email.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanEmail.isEmpty else { validationMessage = String(localized: "请输入 Apple 账户。"); return }
         guard !password.isEmpty else { validationMessage = String(localized: "请输入密码。"); return }
@@ -1227,6 +1244,7 @@ final class AccountStore {
     }
 
     func submitCode(_ code: String) {
+        guard !isValidating else { return }
         let clean = code.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty, pending != nil else { return }
         needsCode = false
@@ -1235,6 +1253,7 @@ final class AccountStore {
     }
 
     func cancelValidation() {
+        validationGeneration &+= 1
         process?.terminate()
         cleanup()
         isValidating = false
@@ -1245,6 +1264,8 @@ final class AccountStore {
 
     private func runValidation(code: String) {
         guard let pending else { return }
+        validationGeneration &+= 1
+        let generation = validationGeneration
         let runtime: (projectURL: URL, mainURL: URL, nodeURL: URL)
         let credentialInput: (pipe: Pipe, data: Data)
         let deviceGUID: String
@@ -1261,7 +1282,6 @@ final class AccountStore {
 
         isValidating = true
         needsCode = false
-        validationLog = ""
 
         let task = Process()
         task.executableURL = runtime.nodeURL
@@ -1276,28 +1296,26 @@ final class AccountStore {
         task.environment = env
         task.standardInput = credentialInput.pipe
 
-        let out = Pipe(); let err = Pipe()
-        task.standardOutput = out; task.standardError = err
-        pipes = (out, err)
-        let handler: @Sendable (FileHandle) -> Void = { [weak self] h in
-            let d = h.availableData
-            guard !d.isEmpty else { return }
-            let t = String(data: d, encoding: .utf8) ?? String(decoding: d, as: UTF8.self)
-            Task { @MainActor in self?.validationLog += t.replacingOccurrences(of: "\r", with: "\n") }
-        }
-        out.fileHandleForReading.readabilityHandler = handler
-        err.fileHandleForReading.readabilityHandler = handler
-        task.terminationHandler = { [weak self] finished in
-            let exit = finished.terminationStatus
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 120_000_000)
-                self?.finishValidation(exitCode: exit)
-            }
-        }
+        // One pipe preserves output order. Drain through EOF before deciding
+        // whether login succeeded; a fixed delay can lose the final JSON line.
+        let output = Pipe()
+        task.standardOutput = output
+        task.standardError = output
+        pipes = (output, output)
         do {
             try task.run()
             process = task
             try NodeRuntime.sendCredentialInput(credentialInput.data, through: credentialInput.pipe)
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                let data = output.fileHandleForReading.readDataToEndOfFile()
+                task.waitUntilExit()
+                let log = String(decoding: data, as: UTF8.self)
+                    .replacingOccurrences(of: "\r", with: "\n")
+                let exitCode = task.terminationStatus
+                Task { @MainActor in
+                    self?.finishValidation(exitCode: exitCode, generation: generation, log: log)
+                }
+            }
         } catch {
             try? credentialInput.pipe.fileHandleForWriting.close()
             if task.isRunning { task.terminate() }
@@ -1307,9 +1325,9 @@ final class AccountStore {
         }
     }
 
-    private func finishValidation(exitCode: Int32) {
+    private func finishValidation(exitCode: Int32, generation: UInt64, log: String) {
+        guard generation == validationGeneration else { return }
         cleanup()
-        let log = validationLog
         if exitCode == 0 {
             isValidating = false
             needsCode = false
@@ -1320,7 +1338,7 @@ final class AccountStore {
         } else if ipaIsVerificationChallenge(log) {
             isValidating = false
             needsCode = true
-            validationMessage = String(localized: "Apple 无法区分密码错误与双重认证。请检查密码；如果已收到验证码，也可以直接输入。")
+            validationMessage = validationError(from: log)
         } else {
             isValidating = false
             needsCode = false
@@ -1335,11 +1353,19 @@ final class AccountStore {
             self.pending = nil
             return false
         }
+        guard let result = log.split(separator: "\n").reversed().compactMap({ line -> [String: Any]? in
+            guard let data = String(line).data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  object["kind"] as? String == "loginValidation",
+                  object["ok"] as? Bool == true,
+                  object["sessionSaved"] as? Bool == true else { return nil }
+            return object
+        }).first else {
+            validationMessage = String(localized: "登录未完成：未收到会话保存成功的确认。请重试。")
+            return false
+        }
         var countryCode = pending.country
-        if let line = log.split(separator: "\n").map(String.init).first(where: { $0.contains("\"storefront\"") }),
-           let data = line.data(using: .utf8),
-           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let storefront = obj["storefront"] as? String,
+        if let storefront = result["storefront"] as? String,
            let mapped = storefrontCountryCode(storefront) {
             countryCode = mapped
         }
@@ -2303,39 +2329,20 @@ struct ContentView: View {
 
     @ToolbarContentBuilder
     private var adaptiveMainToolbar: some ToolbarContent {
-        if #available(macOS 26.1, *) {
-            ToolbarItem(placement: .principal) {
-                floatingModeBar
-            }
-            .sharedBackgroundVisibility(.hidden)
-            .visibilityPriority(.high)
-
-            ToolbarItem(placement: .primaryAction) {
-                toolbarStarButton
-            }
-            .sharedBackgroundVisibility(.hidden)
-
-            ToolbarItem(placement: .primaryAction) {
-                toolbarSettingsButton
-            }
-            .sharedBackgroundVisibility(.hidden)
-            .visibilityPriority(.high)
-        } else {
-            ToolbarItem(placement: .principal) {
-                floatingModeBar
-            }
-            .sharedBackgroundVisibility(.hidden)
-
-            ToolbarItem(placement: .primaryAction) {
-                toolbarStarButton
-            }
-            .sharedBackgroundVisibility(.hidden)
-
-            ToolbarItem(placement: .primaryAction) {
-                toolbarSettingsButton
-            }
-            .sharedBackgroundVisibility(.hidden)
+        ToolbarItem(placement: .principal) {
+            floatingModeBar
         }
+        .pastelHiddenSharedBackground()
+
+        ToolbarItem(placement: .primaryAction) {
+            toolbarStarButton
+        }
+        .pastelHiddenSharedBackground()
+
+        ToolbarItem(placement: .primaryAction) {
+            toolbarSettingsButton
+        }
+        .pastelHiddenSharedBackground()
     }
 
     private var appBackground: some View {
@@ -2352,11 +2359,11 @@ struct ContentView: View {
                 .font(.system(size: 15, weight: .regular))
                 .frame(width: 35, height: 35)
                 .contentShape(Circle())
-                .glassEffect(.regular, in: Circle())
+                .pastelGlassEffect(in: Circle())
         }
         .buttonStyle(.plain)
         .accessibilityLabel(String(localized: "设置"))
-        .help(String(localized: "设置"))
+        .pastelHelp(String(localized: "设置"))
     }
 
     private var toolbarStarButton: some View {
@@ -2368,11 +2375,11 @@ struct ContentView: View {
                 .foregroundStyle(.yellow)
                 .frame(width: 35, height: 35)
                 .contentShape(Circle())
-                .glassEffect(.regular, in: Circle())
+                .pastelGlassEffect(in: Circle())
         }
         .buttonStyle(.plain)
         .accessibilityLabel("GitHub Star")
-        .help("GitHub Star")
+        .pastelHelp("GitHub Star")
     }
 
     private func showSettings() {
@@ -2385,13 +2392,13 @@ struct ContentView: View {
     }
 
     private func openProjectPage() {
-        if let url = URL(string: "https://github.com/EEliberto/Pastel-macOS") {
+        if let url = URL(string: projectURL) {
             NSWorkspace.shared.open(url)
         }
     }
 
     private var floatingModeBar: some View {
-        GlassEffectContainer(spacing: 6) {
+        PastelGlassContainer(spacing: 6) {
             HStack(spacing: 0) {
                 ForEach(Array(RightPanelMode.allCases.enumerated()), id: \.element.id) { index, mode in
                     Button {
@@ -2446,7 +2453,7 @@ struct ContentView: View {
                 Capsule()
                     .stroke(modeBarStroke, lineWidth: 1)
             }
-            .glassEffect(.regular.tint(modeBarGlassTint), in: Capsule())
+            .pastelGlassEffect(tint: modeBarGlassTint, in: Capsule())
         }
     }
 
@@ -2766,13 +2773,13 @@ struct ContentView: View {
             .padding(.horizontal, 18)
             .padding(.bottom, 34)
         }
-        .safeAreaBar(edge: .top, spacing: 4) {
+        .pastelSafeAreaBar(edge: .top, spacing: 4) {
             sidebarSearchPanel
                 .padding(.horizontal, 18)
                 .padding(.top, 8)
                 .padding(.bottom, 8)
         }
-        .scrollEdgeEffectStyle(.soft, for: .top)
+        .pastelScrollEdgeEffect()
         .contentMargins(.trailing, 0, for: .scrollIndicators)
     }
 
@@ -2785,7 +2792,7 @@ struct ContentView: View {
     }
 
     private var sidebarSearchPanel: some View {
-        GlassEffectContainer(spacing: 10) {
+        PastelGlassContainer(spacing: 10) {
             VStack(spacing: 10) {
                 sidebarSearchControls
                 sidebarPlatformPicker
@@ -2839,7 +2846,7 @@ struct ContentView: View {
         .frame(height: 42)
         .frame(maxWidth: .infinity)
         .contentShape(Capsule())
-        .glassEffect(.regular.tint(searchControlGlassTint).interactive(), in: Capsule())
+        .pastelGlassEffect(tint: searchControlGlassTint, interactive: true, in: Capsule())
         .background(searchControlFill, in: Capsule())
         .overlay {
             Capsule()
@@ -2888,7 +2895,7 @@ struct ContentView: View {
         }
         .padding(3)
         .frame(maxWidth: .infinity, minHeight: 36, maxHeight: 36)
-        .glassEffect(.regular.tint(searchControlGlassTint).interactive(), in: Capsule())
+        .pastelGlassEffect(tint: searchControlGlassTint, interactive: true, in: Capsule())
         .background(searchControlFill, in: Capsule())
         .overlay {
             Capsule()
@@ -2967,7 +2974,7 @@ struct ContentView: View {
                             } label: {
                                 Text(String(localized: "前往 Apple 来源获取"))
                             }
-                            .buttonStyle(.glassProminent)
+                            .pastelGlassButtonStyle(prominent: true)
                             .controlSize(.large)
                             .disabled(catalog.isLoadingVersions)
                         }
@@ -2989,7 +2996,7 @@ struct ContentView: View {
                                 } label: {
                                     Text(String(localized: "获取"))
                                 }
-                                .buttonStyle(.glassProminent)
+                                .pastelGlassButtonStyle(prominent: true)
                                 .controlSize(.large)
                                 .disabled(catalog.isLoadingVersions)
                             } else {
@@ -3005,7 +3012,7 @@ struct ContentView: View {
                                 } label: {
                                     Label(String(localized: "查询历史版本"), systemImage: "arrow.clockwise")
                                 }
-                                .buttonStyle(.glassProminent)
+                                .pastelGlassButtonStyle(prominent: true)
                                 .controlSize(.large)
                                 .disabled(catalog.isLoadingVersions)
                             }
@@ -3064,7 +3071,7 @@ struct ContentView: View {
                                 .padding(.top, 4)
                                 .padding(.bottom, 18)
                             }
-                            .safeAreaBar(edge: .top, spacing: 4) {
+                            .pastelSafeAreaBar(edge: .top, spacing: 4) {
                                 versionsHeaderBar
                             }
                             .contentMargins(.bottom, 6, for: .scrollContent)
@@ -3192,7 +3199,7 @@ struct ContentView: View {
     }
 
     private var manualActionSlot: some View {
-        GlassEffectContainer(spacing: 0) {
+        PastelGlassContainer(spacing: 0) {
             ZStack(alignment: .trailing) {
                 manualActionContent
                     .id(manualActionState)
@@ -3214,8 +3221,7 @@ struct ContentView: View {
             )
         case .running:
             DownloadProgressPill(progress: manualDownloadJob?.progress, isPackaging: manualDownloadJob?.isPackaging ?? false)
-                .glassEffectID("manual-download-action", in: manualActionGlassNamespace)
-                .glassEffectTransition(.matchedGeometry)
+                .pastelGlassEffectID("manual-download-action", in: manualActionGlassNamespace)
         case .downloaded:
             FileActionsBar(
                 isSelected: false,
@@ -3235,8 +3241,7 @@ struct ContentView: View {
                     }
                 }
             )
-            .glassEffectID("manual-download-action", in: manualActionGlassNamespace)
-            .glassEffectTransition(.matchedGeometry)
+            .pastelGlassEffectID("manual-download-action", in: manualActionGlassNamespace)
         case .ready:
             Button {
                 downloadManualVersionID()
@@ -3248,9 +3253,8 @@ struct ContentView: View {
             }
             .buttonStyle(StablePressButtonStyle())
             .foregroundStyle(canDownloadManualVersion ? Color.accentColor : Color.secondary)
-            .glassEffect(.regular.interactive(), in: Capsule())
-            .glassEffectID("manual-download-action", in: manualActionGlassNamespace)
-            .glassEffectTransition(.matchedGeometry)
+            .pastelGlassEffect(interactive: true, in: Capsule())
+            .pastelGlassEffectID("manual-download-action", in: manualActionGlassNamespace)
             .disabled(!canDownloadManualVersion)
         }
     }
@@ -3389,7 +3393,7 @@ struct ContentView: View {
     }
 
     private var appStoreSearchBar: some View {
-        GlassEffectContainer(spacing: 12) {
+        PastelGlassContainer(spacing: 12) {
             HStack(spacing: 12) {
                 countryMenu
 
@@ -3423,7 +3427,7 @@ struct ContentView: View {
             .padding(.horizontal, 16)
             .frame(height: 36)
             .frame(maxWidth: .infinity)
-            .glassEffect(.regular.interactive(), in: Capsule())
+            .pastelGlassEffect(interactive: true, in: Capsule())
             .background(Color.black.opacity(0.035), in: Capsule())
             .overlay {
                 Capsule()
@@ -3439,7 +3443,7 @@ struct ContentView: View {
             }
             .buttonStyle(.plain)
             .foregroundStyle(.white)
-            .glassEffect(.regular.tint(Color.accentColor).interactive(), in: Capsule())
+            .pastelGlassEffect(tint: Color.accentColor, interactive: true, in: Capsule())
             .disabled(catalog.isSearching)
         }
     }
@@ -3491,7 +3495,7 @@ struct ContentView: View {
             .padding(.horizontal, 12)
             .frame(width: compactCountryMenuWidth, height: 36)
             .contentShape(Capsule())
-            .glassEffect(.regular.interactive(), in: Capsule())
+            .pastelGlassEffect(interactive: true, in: Capsule())
             .background(Color.black.opacity(0.035), in: Capsule())
             .overlay {
                 Capsule()
@@ -3544,7 +3548,7 @@ struct ContentView: View {
                 } label: {
                     Label(String(localized: "刷新"), systemImage: "arrow.clockwise")
                 }
-                .buttonStyle(.glass)
+                .pastelGlassButtonStyle()
                 .controlSize(.large)
                 .disabled(activeAppID.isEmpty || catalog.isLoadingVersions)
             }
@@ -3567,7 +3571,7 @@ struct ContentView: View {
                     } label: {
                         Label(String(localized: "查询历史版本"), systemImage: "clock.arrow.circlepath")
                     }
-                    .buttonStyle(.glassProminent)
+                    .pastelGlassButtonStyle(prominent: true)
                     .controlSize(.large)
                     .disabled(catalog.isLoadingVersions)
                 }
@@ -3716,13 +3720,13 @@ struct ContentView: View {
             .padding(.horizontal, 18)
             .padding(.bottom, 34)
         }
-        .safeAreaBar(edge: .top, spacing: 4) {
+        .pastelSafeAreaBar(edge: .top, spacing: 4) {
             downloadSidebarSearchPanel
                 .padding(.horizontal, 18)
                 .padding(.top, 8)
                 .padding(.bottom, 8)
         }
-        .scrollEdgeEffectStyle(.soft, for: .top)
+        .pastelScrollEdgeEffect()
         .contentMargins(.trailing, 0, for: .scrollIndicators)
     }
 
@@ -3740,7 +3744,7 @@ struct ContentView: View {
     }
 
     private var downloadSidebarSearchPanel: some View {
-        GlassEffectContainer(spacing: 0) {
+        PastelGlassContainer(spacing: 0) {
             downloadSidebarSearchControls
         }
         .frame(maxWidth: .infinity)
@@ -3777,7 +3781,7 @@ struct ContentView: View {
         .frame(height: 42)
         .frame(maxWidth: .infinity)
         .contentShape(Capsule())
-        .glassEffect(.regular.tint(searchControlGlassTint).interactive(), in: Capsule())
+        .pastelGlassEffect(tint: searchControlGlassTint, interactive: true, in: Capsule())
         .background(searchControlFill, in: Capsule())
         .overlay {
             Capsule()
@@ -3826,7 +3830,7 @@ struct ContentView: View {
                         .padding(.top, 4)
                         .padding(.bottom, 18)
                     }
-                    .safeAreaBar(edge: .top, spacing: 4) {
+                    .pastelSafeAreaBar(edge: .top, spacing: 4) {
                         downloadedVersionsHeaderBar
                     }
                     .contentMargins(.bottom, 6, for: .scrollContent)
@@ -3883,7 +3887,7 @@ struct ContentView: View {
                 }
                 .buttonStyle(StablePressButtonStyle())
                 .foregroundStyle(.primary)
-                .glassEffect(.regular.interactive(), in: Capsule())
+                .pastelGlassEffect(interactive: true, in: Capsule())
             }
         }
         .padding(.horizontal, 2)
@@ -4295,7 +4299,7 @@ struct ContentView: View {
         }
         .background {
             Color(nsColor: .windowBackgroundColor)
-                .backgroundExtensionEffect()
+                .pastelBackgroundExtensionEffect()
         }
     }
 
@@ -4309,7 +4313,7 @@ struct ContentView: View {
                 Label(String(localized: "搜索"), systemImage: "magnifyingglass")
             }
             .controlSize(.large)
-            .buttonStyle(.glass)
+            .pastelGlassButtonStyle()
             .disabled(catalog.isSearching)
         case .versions:
             Button {
@@ -4318,7 +4322,7 @@ struct ContentView: View {
                 Label(String(localized: "查询"), systemImage: "clock.arrow.circlepath")
             }
             .controlSize(.large)
-            .buttonStyle(.glass)
+            .pastelGlassButtonStyle()
             .disabled(catalog.isLoadingVersions)
         case .download:
             Button {
@@ -4327,7 +4331,7 @@ struct ContentView: View {
                 Label(String(localized: "开始下载"), systemImage: "play.fill")
             }
             .controlSize(.large)
-            .buttonStyle(.glassProminent)
+            .pastelGlassButtonStyle(prominent: true)
             .disabled((selectedDownloadJobID().map { downloads.isRunning($0) } ?? false) || activeAppID.isEmpty || versionFeature.selectedVersion == nil)
         case .logs:
             Button {
@@ -4336,7 +4340,7 @@ struct ContentView: View {
                 Label(String(localized: "清空"), systemImage: "trash")
             }
             .controlSize(.large)
-            .buttonStyle(.glass)
+            .pastelGlassButtonStyle()
             .disabled(activeLog.isEmpty || anyRunning)
         }
     }
@@ -5960,7 +5964,7 @@ private struct CopyGlyphButton: View {
         .buttonStyle(.borderless)
         .foregroundStyle(buttonTint)
         .accessibilityLabel(copied ? String(localized: "已复制") : String(localized: "复制"))
-        .help(String(localized: "复制"))
+        .pastelHelp(String(localized: "复制"))
     }
 
     private var buttonTint: Color {
@@ -5981,7 +5985,7 @@ struct FileActionsBar: View {
             FileActionButton(systemImage: "trash", tint: .red, size: 13.5, help: String(localized: "删除本地文件"), action: onDelete)
         }
         .padding(2)
-        .glassEffect(.regular, in: Capsule())
+        .pastelGlassEffect(in: Capsule())
     }
 }
 
@@ -6137,7 +6141,7 @@ struct DownloadProgressPill: View {
         }
         .frame(width: 58, height: 26)
         .clipShape(Capsule())
-        .glassEffect(.regular.tint(Color.accentColor.opacity(0.12)).interactive(), in: Capsule())
+        .pastelGlassEffect(tint: Color.accentColor.opacity(0.12), interactive: true, in: Capsule())
     }
 
     @ViewBuilder
@@ -6225,7 +6229,7 @@ private struct SidebarControlButtonStyleModifier: ViewModifier {
 private struct SidebarActionButtonStyleModifier: ViewModifier {
     func body(content: Content) -> some View {
         content
-            .buttonStyle(.glass)
+            .pastelGlassButtonStyle()
             .controlSize(.large)
             .font(.body)
     }
@@ -6385,7 +6389,7 @@ private struct SettingsContentPane<Accessory: View, Content: View>: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .scrollIndicators(.visible)
-        .scrollEdgeEffectStyle(.hard, for: .top)
+        .pastelScrollEdgeEffect(hard: true)
         .toolbar(removing: .title)
         .toolbar { settingsToolbar }
     }
@@ -6402,7 +6406,7 @@ private struct SettingsContentPane<Accessory: View, Content: View>: View {
                     .fixedSize()
             }
         }
-        .sharedBackgroundVisibility(.hidden)
+        .pastelHiddenSharedBackground()
 
         if Accessory.self != EmptyView.self {
             ToolbarItem(placement: .primaryAction) {
@@ -6432,7 +6436,7 @@ private struct SettingsNavigationButtons: View {
                       action: navigation.goForward)
         }
         .frame(width: 72, height: 32)
-        .glassEffect(.regular, in: Capsule())
+        .pastelGlassEffect(in: Capsule())
     }
 
     private func navButton(systemImage: String, label: String, isEnabled: Bool, action: @escaping () -> Void) -> some View {
@@ -6446,7 +6450,7 @@ private struct SettingsNavigationButtons: View {
         .foregroundStyle(isEnabled ? Color.primary.opacity(0.72) : Color.secondary.opacity(0.28))
         .disabled(!isEnabled)
         .accessibilityLabel(label)
-        .help(label)
+        .pastelHelp(label)
     }
 }
 
@@ -6526,7 +6530,7 @@ private struct SettingsAccountActionsBar: View {
                                         action: onDelete)
         }
         .padding(2.5)
-        .glassEffect(.regular.tint(isSelected ? Color.white.opacity(0.18) : Color.clear), in: Capsule())
+        .pastelGlassEffect(tint: isSelected ? Color.white.opacity(0.18) : Color.clear, in: Capsule())
     }
 }
 
@@ -6585,7 +6589,7 @@ struct AccountSettingsView: View {
     @Environment(AccountStore.self) private var accountStore
     @State private var editor: AccountEditorContext?
     @State private var accountPendingDeletion: StoredAccount?
-    @State private var deviceGUID: String? = try? DeviceGUIDStore.current()
+    @State private var deviceGUID: String?
 
     var body: some View {
         SettingsContentPane(tab: .account) {
@@ -6605,9 +6609,9 @@ struct AccountSettingsView: View {
                             .contentShape(Circle())
                     }
                     .buttonStyle(StablePressButtonStyle())
-                    .glassEffect(.regular.interactive(), in: Circle())
+                    .pastelGlassEffect(interactive: true, in: Circle())
                     .accessibilityLabel(String(localized: "添加账户"))
-                    .help(String(localized: "添加账户"))
+                    .pastelHelp(String(localized: "添加账户"))
 
                     Spacer(minLength: 0)
                 }
@@ -6730,7 +6734,7 @@ private struct SettingsDeviceGUIDRow: View {
             .buttonStyle(.borderless)
             .disabled(deviceGUID == nil)
             .accessibilityLabel(copied ? String(localized: "已复制") : String(localized: "复制设备 GUID"))
-            .help(String(localized: "复制设备 GUID"))
+            .pastelHelp(String(localized: "复制设备 GUID"))
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 10)
@@ -7108,7 +7112,7 @@ struct LanguageSettingsView: View {
 struct AboutSettingsView: View {
     @Environment(AppUpdateManager.self) private var updateManager
     private var appVersion: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "26.7"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "Unknown"
     }
     private var aboutIcon: NSImage? {
         guard let url = Bundle.main.url(forResource: "PastelAboutIcon", withExtension: "png") else {
@@ -7177,12 +7181,18 @@ struct AboutSettingsView: View {
 
                 SettingsGroupDivider()
 
-                CheckForUpdatesSettingsRow(updater: updateManager.updater)
+                CheckForUpdatesSettingsRow(updateManager: updateManager)
 
                 SettingsGroupDivider()
 
-                SettingsInfoRow(title: String(localized: "制作人"),
-                                subtitle: "EEliberto")
+                SettingsLinkRow(title: String(localized: "制作人"),
+                                subtitle: "Jiu-ci", url: projectURL)
+                SettingsGroupDivider()
+                SettingsInfoRow(title: String(localized: "适配开发"),
+                                subtitle: "Codex GPT-6-Astra")
+                SettingsGroupDivider()
+                SettingsLinkRow(title: String(localized: "原作者与原仓库"),
+                                subtitle: "EEliberto / Pastel-macOS", url: upstreamProjectURL)
             }
 
             SettingsGroupBox(String(localized: "开源项目")) {
@@ -7198,10 +7208,6 @@ struct AboutSettingsView: View {
                 SettingsLinkRow(title: "Node.js",
                                 subtitle: String(localized: "内置运行时"),
                                 url: "https://nodejs.org")
-                SettingsGroupDivider()
-                SettingsLinkRow(title: "Sparkle",
-                                subtitle: String(localized: "自动更新框架"),
-                                url: "https://sparkle-project.org")
             }
 
             SettingsGroupBox(String(localized: "第三方依赖")) {
@@ -7313,62 +7319,33 @@ private struct SettingsActionRow: View {
 @MainActor
 @Observable
 final class AppUpdateManager {
-    let updaterController: SPUStandardUpdaterController
-
-    init() {
-        updaterController = SPUStandardUpdaterController(startingUpdater: true,
-                                                         updaterDelegate: nil,
-                                                         userDriverDelegate: nil)
-    }
-
-    var updater: SPUUpdater {
-        updaterController.updater
-    }
-}
-
-@MainActor
-final class CheckForUpdatesViewModel: ObservableObject {
-    @Published var canCheckForUpdates = false
-
-    init(updater: SPUUpdater) {
-        updater.publisher(for: \.canCheckForUpdates)
-            .receive(on: RunLoop.main)
-            .assign(to: &$canCheckForUpdates)
+    // This fork distributes ad-hoc signed DMGs through its own Releases page.
+    // Never initialize the upstream Sparkle updater or reuse its signing key.
+    func checkForUpdates() {
+        guard let url = URL(string: projectURL + "/releases/latest") else { return }
+        NSWorkspace.shared.open(url)
     }
 }
 
 private struct CheckForUpdatesMenuItem: View {
-    @StateObject private var viewModel: CheckForUpdatesViewModel
-    private let updater: SPUUpdater
-
-    init(updater: SPUUpdater) {
-        self.updater = updater
-        _viewModel = StateObject(wrappedValue: CheckForUpdatesViewModel(updater: updater))
-    }
+    let updateManager: AppUpdateManager
 
     var body: some View {
         Button(String(localized: "检查更新…")) {
-            updater.checkForUpdates()
+            updateManager.checkForUpdates()
         }
-        .disabled(!viewModel.canCheckForUpdates)
     }
 }
 
 private struct CheckForUpdatesSettingsRow: View {
-    @StateObject private var viewModel: CheckForUpdatesViewModel
-    private let updater: SPUUpdater
-
-    init(updater: SPUUpdater) {
-        self.updater = updater
-        _viewModel = StateObject(wrappedValue: CheckForUpdatesViewModel(updater: updater))
-    }
+    let updateManager: AppUpdateManager
 
     var body: some View {
         SettingsActionRow(title: String(localized: "检查更新"),
-                          subtitle: String(localized: "从 GitHub 检查 Pastel 新版本。"),
+                          subtitle: String(localized: "打开此适配版的 GitHub Releases 页面。"),
                           systemImage: "arrow.clockwise",
-                          isEnabled: viewModel.canCheckForUpdates) {
-            updater.checkForUpdates()
+                          isEnabled: true) {
+            updateManager.checkForUpdates()
         }
     }
 }
@@ -7470,7 +7447,7 @@ struct PastelSettingsCommands: Commands {
         }
 
         CommandGroup(after: .appInfo) {
-            CheckForUpdatesMenuItem(updater: updateManager.updater)
+            CheckForUpdatesMenuItem(updateManager: updateManager)
         }
     }
 }

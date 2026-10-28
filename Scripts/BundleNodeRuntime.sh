@@ -54,10 +54,5 @@ for (let index = 0; index < 250000; index += 1) result = hot(result + index);
 if (!process.versions.node.startsWith("24.") || !Number.isInteger(result)) process.exit(1);
 '
 
-sh "${SRCROOT}/Scripts/PatchSparkleLocalizations.sh" "${CODESIGNING_FOLDER_PATH}"
-sparkle_framework="${CODESIGNING_FOLDER_PATH}/Contents/Frameworks/Sparkle.framework"
-if [ -d "${sparkle_framework}" ]; then
-    codesign --force --sign - "${sparkle_framework}"
-fi
 xattr -cr "${CODESIGNING_FOLDER_PATH}" || true
 touch "${DERIVED_FILE_DIR}/pastel-node-runtime.stamp"

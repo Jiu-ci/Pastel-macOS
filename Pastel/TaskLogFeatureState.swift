@@ -30,9 +30,9 @@ struct DownloadErrorIndicator: View {
                     .contentShape(Capsule())
             }
             .buttonStyle(StablePressButtonStyle())
-            .glassEffect(.regular.tint(Color.yellow.opacity(0.18)).interactive(), in: Capsule())
+            .pastelGlassEffect(tint: Color.yellow.opacity(0.18), interactive: true, in: Capsule())
             .accessibilityLabel(String(localized: "查看下载错误"))
-            .help(message)
+            .pastelHelp(message)
             .popover(isPresented: $isShowingError, arrowEdge: .trailing) {
                 VStack(alignment: .leading, spacing: 14) {
                     Label(String(localized: "下载失败"), systemImage: "exclamationmark.triangle.fill")
@@ -79,8 +79,8 @@ struct DownloadErrorIndicator: View {
                 }
                 .buttonStyle(StablePressButtonStyle())
                 .foregroundStyle(Color.accentColor)
-                .glassEffect(.regular.interactive(), in: Capsule())
-                .help(message)
+                .pastelGlassEffect(interactive: true, in: Capsule())
+                .pastelHelp(message)
             }
         }
     }

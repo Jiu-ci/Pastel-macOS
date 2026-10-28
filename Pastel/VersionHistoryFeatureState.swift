@@ -76,7 +76,7 @@ struct SourceProviderCapsule: View {
             Capsule()
                 .stroke(providerStroke, lineWidth: 1)
         }
-        .glassEffect(.regular.tint(providerGlassTint).interactive(), in: Capsule())
+        .pastelGlassEffect(tint: providerGlassTint, interactive: true, in: Capsule())
         .opacity(isDisabled ? 0.55 : 1)
         .allowsHitTesting(!isDisabled)
     }
@@ -278,7 +278,7 @@ struct VersionSelectionRow: View {
                 }
                 .padding(.trailing, Self.noUpdatesToggleTrailingInset)
                 .frame(width: columns.noUpdates, alignment: .trailing)
-                .help(String(localized: "下载后不再显示 App Store 更新"))
+                .pastelHelp(String(localized: "下载后不再显示 App Store 更新"))
 
                 Color.clear
                     .frame(width: Self.actionGap, height: 1)
@@ -316,7 +316,7 @@ struct VersionSelectionRow: View {
 
     @ViewBuilder
     private var actionSlot: some View {
-        GlassEffectContainer(spacing: 0) {
+        PastelGlassContainer(spacing: 0) {
             ZStack(alignment: .trailing) {
                 actionContent
                     .id(actionState)
@@ -338,12 +338,10 @@ struct VersionSelectionRow: View {
             )
         case .running:
             DownloadProgressPill(progress: downloadProgress, isPackaging: isPackaging)
-                .glassEffectID("version-row-action", in: actionGlassNamespace)
-                .glassEffectTransition(.matchedGeometry)
+                .pastelGlassEffectID("version-row-action", in: actionGlassNamespace)
         case .downloaded:
             FileActionsBar(isSelected: isSelected, onReveal: onReveal, onAirDrop: onAirDrop, onDelete: onDelete)
-                .glassEffectID("version-row-action", in: actionGlassNamespace)
-                .glassEffectTransition(.matchedGeometry)
+                .pastelGlassEffectID("version-row-action", in: actionGlassNamespace)
         case .ready:
             Button {
                 onDownload()
@@ -366,9 +364,8 @@ struct VersionSelectionRow: View {
             }
             .buttonStyle(StablePressButtonStyle())
             .foregroundStyle(Color.accentColor)
-            .glassEffect(.regular.tint(isSelected ? Color.white.opacity(0.34) : nil).interactive(), in: Capsule())
-            .glassEffectID("version-row-action", in: actionGlassNamespace)
-            .glassEffectTransition(.matchedGeometry)
+            .pastelGlassEffect(tint: isSelected ? Color.white.opacity(0.34) : nil, interactive: true, in: Capsule())
+            .pastelGlassEffectID("version-row-action", in: actionGlassNamespace)
         }
     }
 

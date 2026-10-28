@@ -273,14 +273,18 @@ async function postAuthenticationWithRetry(url, body, jar, signerSession) {
     let response;
     for (let requestAttempt = 0; requestAttempt <= AUTH_RETRY_DELAYS_MS.length; requestAttempt++) {
         response = await postWithSAP(url, body, jar, signerSession);
-        const retryable = response.status === 204
-            || response.status === 404
-            || response.status === 429
-            || response.status >= 500;
+        const retryable = shouldRetryAuthenticationRequest(url, response.status);
         if (!retryable || requestAttempt === AUTH_RETRY_DELAYS_MS.length) return response;
         sleepSync(AUTH_RETRY_DELAYS_MS[requestAttempt]);
     }
     return response;
+}
+
+export function shouldRetryAuthenticationRequest(endpoint, status) {
+    // These native responses already have a legacy fallback. Retrying the same
+    // endpoint delays every 2FA submission by 30 seconds before trying it.
+    if (shouldRetryWithLegacyAuthenticate(endpoint, status)) return false;
+    return status === 204 || status === 404 || status === 429 || status >= 500;
 }
 
 // ---- 判断是否应 fallback 到 legacy 端点（对齐 shouldRetryWithLegacyAuthenticate()） ----
@@ -288,6 +292,26 @@ async function postAuthenticationWithRetry(url, body, jar, signerSession) {
 export function shouldRetryWithLegacyAuthenticate(endpoint, status) {
     if (!endpoint.includes('/native/')) return false;
     return [204, 403, 404, 503].includes(Number(status));
+}
+
+// Only fixed endpoint names and response metadata may enter diagnostics.
+// Never log URLs (which include GUIDs), headers, cookies or response bodies.
+export function storeResponseDiagnostic(res, endpoint, parsed = null) {
+    const knownPaths = {
+        '/auth/v1/native/fast/': 'authenticate-native',
+        '/WebObjects/MZFinance.woa/wa/authenticate': 'authenticate-legacy',
+        '/WebObjects/MZFinance.woa/wa/volumeStoreDownloadProduct': 'volumeStoreDownloadProduct',
+        '/r/redownload': 'redownload',
+        '/up/updateProduct': 'updateProduct',
+        '/WebObjects/MZFinance.woa/wa/buyProduct': 'buyProduct',
+    };
+    let operation = 'store';
+    try { operation = knownPaths[new URL(endpoint).pathname] || operation; } catch { /* keep fixed label */ }
+    const rawFailure = String(parsed?.failureType || '');
+    const failure = /^-?\d{1,8}$/.test(rawFailure) ? rawFailure : (rawFailure ? 'other' : 'none');
+    const status = Number.isInteger(res?.status) ? res.status : 0;
+    const bytes = Buffer.isBuffer(res?.body) ? res.body.length : 0;
+    return `[Store] endpoint=${operation} HTTP=${status} bytes=${bytes} failure=${failure}`;
 }
 
 // ---- 核心登录循环（精确对齐 login() for 循环）----
@@ -317,6 +341,9 @@ async function storePasswordAuthenticate(email, password, code, guid, jar, endpo
         res = await postAuthenticationWithRetry(targetURL, body, jar, signerSession);
         // parseLoginResponse 逻辑
         const parsed = parseLoginResponse(res, attempt, code);
+        const diagnostic = storeResponseDiagnostic(res, targetURL);
+        console.log(diagnostic);
+        if (parsed.error) parsed.error.message += ` (${diagnostic})`;
         retry = parsed.retry;
         redirect = parsed.redirect;
         if (parsed.error) throw parsed.error;
@@ -371,6 +398,15 @@ export function parseLoginResponse(res, attempt, authCode) {
         return {retry: false, redirect: '', error: ambiguousAuthError(), data: null};
     }
 
+    // Apple still does not distinguish a rejected password from a rejected
+    // verification code here. Preserve that ambiguity and allow another code,
+    // instead of falling through to a generic token error or replaying it.
+    if (failureType === '' && authCode && customerMessage === CUSTOMER_MESSAGE_BAD_LOGIN) {
+        const error = new Error(t('auth_code_rejected'));
+        error.code = 'AUTH_CODE_REJECTED';
+        return {retry: false, redirect: '', error, data: null};
+    }
+
     // failureType=="" && customerMessage=="Your account is disabled."
     if (failureType === '' && customerMessage === CUSTOMER_MESSAGE_ACCOUNT_DISABLED) {
         return {retry: false, redirect: '', error: new Error(t('wrong_password')), data: null};
@@ -408,8 +444,7 @@ export async function storeLogin(email, password, code, guid, cookieText = '', p
     // 从 bag.xml 获取 native 端点（对齐 Bag() 的调用方式）
     const endpoints = authenticationEndpoints(guid, pod);
 
-    // 同一次登录和 2FA 验证必须保持同一个 SAP 会话；签完即关闭会使
-    // Apple 在认证前返回 204/301/403 空响应。
+    // 当前进程内的认证请求和重试共享 SAP 会话；验证码提交会启动新的进程。
     const signerSession = await PersistentSAPSigner.open();
     let res;
     let parsed;
@@ -421,7 +456,7 @@ export async function storeLogin(email, password, code, guid, cookieText = '', p
                 lastError = null;
                 break;
             } catch (error) {
-                if (error?.code === 'AUTH_OR_2FA' || error?.code === 'NEEDS_2FA') throw error;
+                if (['AUTH_OR_2FA', 'NEEDS_2FA', 'AUTH_CODE_REJECTED'].includes(error?.code)) throw error;
                 lastError = error;
             }
         }

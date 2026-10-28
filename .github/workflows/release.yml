@@ -1,0 +1,110 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'Pastel[0-9]*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag, e.g. Pastel20261028.1'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build macOS 15 arm64 DMG
+    runs-on: macos-15
+    timeout-minutes: 45
+    outputs:
+      tag: ${{ steps.metadata.outputs.tag }}
+      version: ${{ steps.metadata.outputs.version }}
+      dmg: ${{ steps.metadata.outputs.dmg }}
+      notes: ${{ steps.metadata.outputs.notes }}
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
+      PASTEL_OUTPUT_DIR: ${{ github.workspace }}/dist
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
+          persist-credentials: false
+
+      - name: Validate tag and release metadata
+        id: metadata
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: python3 Scripts/ReleaseMetadata.py --tag "$RELEASE_TAG"
+
+      - name: Verify toolchain
+        run: |
+          test "$(uname -m)" = arm64
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+
+      - name: Build, test, sign and package
+        env:
+          PASTEL_DERIVED_DATA: ${{ runner.temp }}/PastelRelease
+        run: sh Scripts/BuildAdHocDMG.sh
+
+      - name: Verify single release asset
+        env:
+          DMG_NAME: ${{ steps.metadata.outputs.dmg }}
+        run: |
+          test -f "dist/$DMG_NAME"
+          test "$(find dist -maxdepth 1 -name '*.dmg' | wc -l | tr -d ' ')" = 1
+          hdiutil verify "dist/$DMG_NAME"
+          shasum -a 256 "dist/$DMG_NAME"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pastel-dmg
+          path: dist/${{ steps.metadata.outputs.dmg }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish one DMG to GitHub Releases
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.build.outputs.tag }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: pastel-dmg
+          path: dist
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.build.outputs.tag }}
+          VERSION: ${{ needs.build.outputs.version }}
+          DMG_NAME: ${{ needs.build.outputs.dmg }}
+          NOTES_PATH: ${{ needs.build.outputs.notes }}
+        run: |
+          cp "$NOTES_PATH" "$RUNNER_TEMP/release-notes.md"
+          {
+            printf '\n## SHA-256\n\n```text\n'
+            (cd dist && sha256sum "$DMG_NAME")
+            printf '```\n'
+          } >> "$RUNNER_TEMP/release-notes.md"
+          # create deliberately fails when the release exists; never overwrite it.
+          gh release create "$RELEASE_TAG" "dist/$DMG_NAME" \
+            --verify-tag \
+            --title "Pastel $VERSION · macOS 15 适配版" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"

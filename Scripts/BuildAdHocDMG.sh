@@ -2,9 +2,9 @@
 set -eu
 
 project_root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-developer_dir=${DEVELOPER_DIR:-/Applications/Xcode-beta.app/Contents/Developer}
+developer_dir=${DEVELOPER_DIR:-$(xcode-select -p)}
 # Keep products outside the iCloud-synced source tree. Finder/iCloud metadata on
-# nested Sparkle bundles is rejected by codesign as resource-fork detritus.
+# app bundles can be rejected by codesign as resource-fork detritus.
 derived_data=${PASTEL_DERIVED_DATA:-"${TMPDIR:-/tmp}/PastelDistributionDerivedData"}
 output_dir=${PASTEL_OUTPUT_DIR:-"${project_root}/dist"}
 
@@ -26,6 +26,20 @@ node="${app}/Contents/Resources/node/bin/node"
 signer="${app}/Contents/Resources/sap-signer"
 
 test -d "$app"
+# Test the bundled code and dependencies, even on a clean CI checkout with no
+# NodeProject/node_modules. Keep test fixtures outside the signed app bundle.
+(
+    test_workspace=$(mktemp -d "${TMPDIR:-/tmp}/pastel-tests.XXXXXX")
+    trap 'rm -rf "$test_workspace"' EXIT HUP INT TERM
+    ditto "${project_root}/NodeProject/test" "${test_workspace}/test"
+    bundled_project="${app}/Contents/Resources/NodeProject"
+    for item in src main.js package.json node_modules; do
+        ln -s "${bundled_project}/${item}" "${test_workspace}/${item}"
+    done
+    "$node" --test "${test_workspace}/test/"*.test.js
+)
+test "$(/usr/bin/lipo -archs "${app}/Contents/MacOS/Pastel")" = "arm64"
+test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "${app}/Contents/Info.plist")" = "15.0"
 codesign --verify --strict "$signer"
 codesign --verify --strict "$node"
 codesign --verify --deep --strict "$app"
@@ -49,7 +63,7 @@ trap 'rm -rf "$staging"' EXIT HUP INT TERM
 mkdir -p "$output_dir"
 ditto "$app" "${staging}/Pastel.app"
 ln -s /Applications "${staging}/Applications"
-rm -f "$dmg"
-hdiutil create -quiet -fs HFS+ -volname Pastel -srcfolder "$staging" -format UDZO "$dmg"
+hdiutil create -quiet -ov -fs HFS+ -volname Pastel -srcfolder "$staging" -format UDZO "$dmg"
 
+hdiutil verify "$dmg"
 echo "Created ${dmg}"
