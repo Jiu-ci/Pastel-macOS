@@ -1,0 +1,11 @@
+--- a/internal/sap/assets/http_range.go
++++ b/internal/sap/assets/http_range.go
+@@ -13,0 +14,4 @@
++
++// Some Apple CDN edges reject Go's default User-Agent before serving ranges.
++// This identifies only public asset requests; Store authentication headers stay unchanged.
++const authenticationAssetUserAgent = "panghu/1.0"
+@@ -28,0 +33 @@
++	request.Header.Set("User-Agent", authenticationAssetUserAgent)
+@@ -112,0 +118 @@
++		request.Header.Set("User-Agent", authenticationAssetUserAgent)

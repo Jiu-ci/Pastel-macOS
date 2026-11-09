@@ -39,6 +39,7 @@
 - macOS 26 保留 Liquid Glass；macOS 15 使用兼容的材质、按钮和布局。
 - macOS 15 停用可能触发 `TooltipResponder / AttributeGraph` 崩溃的 SwiftUI 悬停提示，保留辅助功能提示。
 - 同步上游 20261109 的认证、并发下载和首次免费 App 获取修复，使用固定版本 ipatool 的 StoreHelper；helper 已按 macOS 15 重新构建。
+- 修复首次准备 Apple 认证资源时 Go 默认请求标识导致的 CDN 403，保留分段读取和文件完整性校验。资源报错中的 macOS 27 是认证组件使用的框架版本，App 最低系统仍为 macOS 15。
 - 设备 GUID 在进程内缓存并使用上游的文件存储方案；登录成功需确认加密会话已保存，取消后的旧登录回调不会干扰新登录。
 - 下载接口的空 HTTP 403 不再被一律判定为“账户会话失效”，日志保留接口名称、状态码等诊断信息。
 
@@ -55,6 +56,8 @@
 需要 **Xcode 26.2 或更高版本**（macOS 26 SDK）和联网环境。编译 SDK 与最低运行系统不同：生成的 App 最低支持 macOS 15.0。仓库内置 Node.js 24 和 macOS 15 版 store-helper，构建时根据锁文件安装依赖，无需单独安装 Node.js。
 
 修改 `StoreHelper/` 源码或固定依赖后，需要 Go 1.26.5（可由 Go 自动下载工具链），执行 `sh Scripts/BuildStoreHelper.sh` 并提交重新生成的 `node/bin/store-helper.gz`。不能直接使用上游预编译 helper；打包会检查所有内嵌可执行文件的最低系统版本。
+
+helper 构建脚本会通过 `Scripts/StoreHelperGo.py` 在临时副本中应用固定版本的资源请求补丁；直接运行 `go build` 不会包含该修复。补丁维护和测试命令见 [StoreHelper/README.md](StoreHelper/README.md)。
 
 ```bash
 open Pastel.xcodeproj
@@ -79,8 +82,8 @@ sh Scripts/BuildAdHocDMG.sh
 3. 推送 `Pastel<版本>` 标签，自动触发构建、测试和 Release 发布。例如本次适配版本：
 
 ```bash
-git tag Pastel20261109.1
-git push origin Pastel20261109.1
+git tag Pastel20261109.2
+git push origin Pastel20261109.2
 ```
 
 也可在 Actions 中选择 **Release → Run workflow**，输入已推送的标签。标签必须与代码中的版本匹配；构建或校验失败时不会发布。成功后 Release 只有一个 DMG 附件，SHA-256 校验值写入发布说明。已发布的 Release 不会被自动覆盖。
@@ -93,6 +96,7 @@ git push origin Pastel20261109.1
 
 ## 更新记录
 
+- [20261109.2：修复 Apple 认证资源下载 403](release-notes/20261109.2/release-notes.md)
 - [20261109.1：同步上游登录与下载修复](release-notes/20261109.1/release-notes.md)
 
 - [20261028.1：macOS 15 适配版与自动发布](release-notes/20261028.1/release-notes.md)

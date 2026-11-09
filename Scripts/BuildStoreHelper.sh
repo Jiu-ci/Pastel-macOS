@@ -13,7 +13,8 @@ cd "${project_root}/StoreHelper"
 export MACOSX_DEPLOYMENT_TARGET=15.0
 export CGO_CFLAGS="${CGO_CFLAGS:-} -mmacosx-version-min=15.0"
 export CGO_LDFLAGS="${CGO_LDFLAGS:-} -mmacosx-version-min=15.0"
-GOOS=darwin GOARCH=arm64 CGO_ENABLED=1 "$go_bin" build -mod=readonly -trimpath -ldflags='-s -w' -o "$staging/store-helper" .
+GOOS=darwin GOARCH=arm64 CGO_ENABLED=1 PASTEL_GO="$go_bin" \
+    python3 "${project_root}/Scripts/StoreHelperGo.py" build -mod=readonly -trimpath -ldflags='-s -w' -o "$staging/store-helper" .
 python3 "${project_root}/Scripts/VerifyMacOSCompatibility.py" "$staging/store-helper"
 "$go_bin" version -m "$staging/store-helper"
 gzip -n -c "$staging/store-helper" > "$staging/store-helper.gz"

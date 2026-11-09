@@ -17,6 +17,18 @@ target to 15.0 and rejects a rebuilt binary requiring a newer OS. Do not copy
 the upstream prebuilt helper without rebuilding and checking its minimum OS. Xcode's existing bundle phase decompresses and signs this
 archive; changing Go sources alone does not update the shipped executable.
 
+`Scripts/StoreHelperGo.py` copies the pinned module to a temporary directory,
+verifies the source digest, and applies `patches/ipatool-v2.8.0-assets.patch`.
+The patch identifies public restore-image range requests with `panghu/1.0`:
+some Apple CDN edges reject Go's default User-Agent with HTTP 403. It preserves
+the pinned URL, range validation, file sizes, and SHA-256 checks. Store login
+headers and the global HTTP transport are unchanged. The module cache stays
+intact, and dependency updates require reviewing the patch and pinned digest.
+Use the wrapper for builds/tests; a direct `go build` omits the patch.
+
+The macOS version named in asset errors identifies the emulated framework
+profile. It does not change this fork's macOS 15.0 minimum host requirement.
+
 The stdin JSON request carries `sessionKey` (base64, 32 bytes), supplied by
 Pastel's existing Keychain-backed encryption vault. Device state and
 account-scoped cookies are AES-GCM encrypted under
@@ -48,8 +60,16 @@ not prove that the password is correct.
 Checks:
 
 ```sh
-cd StoreHelper
-MACOSX_DEPLOYMENT_TARGET=15.0 go test -race ./...
+MACOSX_DEPLOYMENT_TARGET=15.0 python3 Scripts/StoreHelperGo.py test -mod=readonly -race ./...
+python3 Scripts/StoreHelperGo.py --upstream test -mod=readonly -race ./internal/sap/assets
+```
+
+Optional online preparation check from the repository root (public resources
+only, uses the normal verified asset cache, no Apple account credentials):
+
+```sh
+PASTEL_TEST_APPLE_ASSETS=1 python3 Scripts/StoreHelperGo.py --upstream test \
+  -mod=readonly ./internal/sap/assets -run '^TestPanghuLiveAssets$' -v -count=1 -timeout 12m
 ```
 
 Real-account login, code delivery, and an authorized IPA download still require

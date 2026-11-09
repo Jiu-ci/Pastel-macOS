@@ -31,6 +31,7 @@
 
 - 活跃登录/下载路径为 Swift → Node → `StoreHelper`。上游新认证流程依赖 helper；不能只合并 Swift/JS 而遗漏 helper 或继续运行旧二进制。
 - `StoreHelper/go.mod` 固定 Go 工具链及 ipatool 依赖；更新源码或依赖后执行 `sh Scripts/BuildStoreHelper.sh`，提交重新生成的 `node/bin/store-helper.gz`。
+- `Scripts/StoreHelperGo.py` 在临时源码副本中应用 `StoreHelper/patches/ipatool-v2.8.0-assets.patch`，修正 Apple 公共镜像对 Go 默认 User-Agent 返回 403 的问题；不修改 Go 模块缓存。构建和测试必须使用该入口，直接 `go build` 会遗漏补丁。升级依赖时重新审查补丁、固定源码摘要和资源下载测试，不能跳过校验；保留 Range、长度、SHA-256 校验，不修改全局 HTTP transport 或 Store 认证请求头。
 - helper 构建必须显式指定 macOS 15 的 C 编译和链接目标。上游预编译文件即使能启动，也不能直接当作 macOS 15 兼容文件使用。
 - `Scripts/VerifyMacOSCompatibility.py` 检查 App、Node、SAP signer 和 store-helper 的 arm64 架构及 Mach-O 最低系统版本，不能通过修改 Mach-O 头或跳过检查掩盖不兼容。
 - 保留内嵌 Node 的 JIT 权限、helper 所需权限及从内向外的签名顺序；不要给所有可执行文件套用同一份权限。
@@ -38,7 +39,8 @@
 ## 验证与交付
 
 - Node：在 `NodeProject` 执行 Node 24 的 `node --test`；正式打包会针对实际内嵌代码和依赖再次运行测试。
-- Go：在 `StoreHelper` 执行 `MACOSX_DEPLOYMENT_TARGET=15.0 go test -race ./...`。
+- Go：在仓库根目录执行 `MACOSX_DEPLOYMENT_TARGET=15.0 python3 Scripts/StoreHelperGo.py test -mod=readonly -race ./...`。
+- 认证资源：执行 `python3 Scripts/StoreHelperGo.py --upstream test -mod=readonly -race ./internal/sap/assets`；显式添加 `PASTEL_TEST_APPLE_ASSETS=1` 并使用 `-run '^TestPanghuLiveAssets$' -count=1 -timeout 12m` 可验证公共资源在线准备和完整性，不读取账户凭据。
 - Swift 元数据：用 `swiftc Pastel/IPAMetadata.swift Scripts/Tests/IPAMetadataTests.swift` 编译到临时目录后运行。
 - 构建：`sh Scripts/BuildAdHocDMG.sh`；通过 `PASTEL_DERIVED_DATA`、`PASTEL_OUTPUT_DIR` 指定独立构建和输出目录，不覆盖旧安装包。
 - 同时验证 Debug 和 Release，避免遗漏仅 Debug 编译的登录模拟代码；模拟说明见 `docs/LOGIN_SIMULATION.md`。
