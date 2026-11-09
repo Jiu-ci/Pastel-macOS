@@ -3,7 +3,7 @@ import os from 'os';
 import {createCipheriv, createDecipheriv, createHash, randomBytes} from 'crypto';
 import path from 'path';
 import {Store} from './client.js';
-import {appPriceInfo, officialCurrentVersion, storefrontCurrentVersion} from './catalog.js';
+import {appPriceInfo, lookupApp, officialCurrentVersion, storefrontCurrentVersion} from './catalog.js';
 
 function versionIdentifiersFromSong(song) {
     const metadata = song?.metadata || {};
@@ -66,11 +66,12 @@ import {readCookieJar, restoreCookieJar} from './gsa.js';
 import {SignatureClient} from './Signature.js';
 import {download} from './downloader.js';
 import {t} from './i18n.js';
+import {helperUser, runStoreHelper, storeAuthenticationError} from './store-helper.js';
 
 const DEFAULT_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_TTL_MS = Number(process.env.IPA_SESSION_TTL_MS || DEFAULT_SESSION_TTL_MS);
-const SESSION_FLOW_VERSION = 'appstore-direct-v1';
-const ACCEPTED_SESSION_FLOW_VERSIONS = new Set([SESSION_FLOW_VERSION, 'gsa-srp-v10']);
+const SESSION_FLOW_VERSION = 'appstore-amd-v2';
+const ACCEPTED_SESSION_FLOW_VERSIONS = new Set([SESSION_FLOW_VERSION]);
 const ENCRYPTED_SESSION_FORMAT = 'pastel-session-aes-gcm-v1';
 
 function decodeSessionKey(value) {
@@ -185,6 +186,8 @@ export class Ipa {
                 pod: user.pod || '',
                 authHeaders: user.authHeaders,
                 cookieText: user.cookieText || '',
+                frameworkAccount: user.frameworkAccount ? {...user.frameworkAccount, password: undefined} : undefined,
+                frameworkCookieState: user.frameworkCookieState || [],
             }
         };
         await this.writeEncryptedSession(session);
@@ -236,7 +239,20 @@ export class Ipa {
         await this.clearSession();
         this.user = null;
         this.auth = {};
-        const user = await Store.login(this.creds.APPLE_ID, this.creds.PASSWORD, this.creds.CODE, previousSession);
+        let user;
+        let lastError;
+        for (const delayMs of [0, 750]) {
+            if (delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs));
+            try {
+                user = await Store.login(this.creds.APPLE_ID, this.creds.PASSWORD, this.creds.CODE, previousSession, this.sessionEncryptionKey?.toString('base64') || '');
+                lastError = null;
+                break;
+            } catch (error) {
+                lastError = error;
+                if (error?.code !== 'AUTH_TRANSIENT') throw error;
+            }
+        }
+        if (lastError) throw lastError;
         try {
             await this.saveSession(user);
         } catch (error) {
@@ -283,14 +299,97 @@ export class Ipa {
         return info ? info.isFree : false;
     }
 
+    async helperApp(APPID) {
+        const country = process.env.IPA_APP_COUNTRY || 'us';
+        const platform = process.env.IPA_APP_PLATFORM || 'iphone';
+        let metadata = null;
+        try {
+            const lookup = await lookupApp(String(APPID), {country, platform});
+            metadata = lookup?.results?.[0] || null;
+        } catch {
+            // The private Store endpoint can still work when the public lookup
+            // endpoint is temporarily unavailable.
+        }
+        const isFree = await this.isFreeApp(APPID);
+        return {
+            trackId: Number(APPID),
+            bundleId: metadata?.bundleId || '',
+            trackName: metadata?.name || `App_${APPID}`,
+            version: metadata?.version || '',
+            price: isFree ? 0 : 1,
+        };
+    }
+
+    async helperRequest(command, extra = {}, {progress = false} = {}) {
+        if (!this.user) await this.login();
+        let packagingEmitted = false;
+        try {
+            const result = await runStoreHelper({
+                command,
+                email: this.creds.APPLE_ID,
+                password: this.creds.PASSWORD,
+                code: this.creds.CODE || '',
+                guid: Store.guid,
+                sessionKey: this.sessionEncryptionKey?.toString('base64') || '',
+                account: this.user?.frameworkAccount,
+                cookieState: this.user?.frameworkCookieState || [],
+                ...extra,
+            }, {
+                onProgress: progress ? percent => {
+                    process.stdout.write(`0 MB / 0 MB ${percent}%\r`);
+                    if (percent >= 100 && !packagingEmitted) {
+                        packagingEmitted = true;
+                        process.stdout.write('\n@@IPA:phase=packaging\n');
+                    }
+                } : undefined,
+            });
+            if (result.account) {
+                this.applyUser(helperUser(result, this.creds.APPLE_ID), false);
+                await this.saveSession(this.user).catch(error => {
+                    console.log(t('save_session_failed', {message: error.message}));
+                });
+            }
+            return result;
+        } catch (error) {
+            if (error.code?.startsWith('AUTH_') || ['INVALID_CREDENTIALS', 'ACCOUNT_DISABLED', 'TOKEN_EXPIRED'].includes(error.code)) {
+                throw storeAuthenticationError(error);
+            }
+            throw error;
+        }
+    }
+
     // 从 Apple 官方元数据获取该 App 的全部历史版本 ID（外部版本标识）。
     // 用于第三方来源不可用时的兜底：登录后读取 softwareVersionExternalIdentifiers。
     async listVersionIds(APPID) {
-        if (!this.user) throw new Error('Please login() first');
         return await this._withReauth(() => this._listVersionIdsOnce(APPID));
     }
 
     async _listVersionIdsOnce(APPID) {
+        const app = await this.helperApp(APPID);
+        const platform = process.env.IPA_APP_PLATFORM || 'iphone';
+        let result;
+        try {
+            result = await this.helperRequest('listVersions', {app, platform});
+        } catch (error) {
+            if (error.code !== 'LICENSE_REQUIRED') throw error;
+            if (app.price > 0) throw new Error(t('paid_not_purchased'));
+            if (process.env.IPA_ALLOW_APP_ACQUIRE !== '1') {
+                return {appId: String(APPID), requiresAcquisition: true, versionIds: []};
+            }
+            await this.helperRequest('purchase', {app, platform});
+            result = await this.helperRequest('listVersions', {app, platform});
+        }
+        const identifiers = (result?.versions?.ExternalVersionIdentifiers || []).map(String);
+        return {
+            appId: String(APPID),
+            name: app.trackName,
+            latestVersion: app.version,
+            latestVersionId: String(result?.versions?.LatestExternalVersionID || identifiers.at(-1) || ''),
+            versionIds: identifiers,
+        };
+
+        /* Legacy StoreServices implementation retained below for unit-test
+           coverage; production returns through the framework helper above. */
         // 先直接查（已购买 / 已获取过的 App 无需再申请许可，不产生任何副作用）。
         let song = await appInfoWithCurrentVersionFallback({
             appId: APPID,
@@ -356,25 +455,31 @@ export class Ipa {
     }
 
     async runDownload({dir = '.', APPID, appVerId} = {}) {
-        if (!this.user) throw new Error('Please login() first');
         this.dir = dir;
-        this.cache = await fsPromises.mkdtemp(path.join(os.tmpdir(), 'ipa-history-download-parts-'));
-        console.log(t('temp_dir', {cache: this.cache}));
+        const app = await this.helperApp(APPID);
+        const platform = process.env.IPA_APP_PLATFORM || 'iphone';
         try {
-            const song = await this.downloadInfo(APPID, appVerId);
-            const res = await download(song.URL, this.out, this.cache, this.auth.authHeaders || {});
-            console.log(t('download_complete', {mb: (res.fileSize / 1024 / 1024).toFixed(2), parts: res.parts}));
-            // 稳定的机器标记：进入「校验/签名/存档」阶段，供 App 显示「打包中」（与显示文案解耦，不随语言变化）。
-            console.log('@@IPA:phase=packaging');
-            const signer = new SignatureClient(song, this.user.accountInfo.appleId, {
-                includeAppStoreMetadata: process.env.IPA_REMOVE_APP_STORE_UPDATE_METADATA !== '1',
-            });
-            await signer.sign(this.out);
-
+            const downloadRequest = {
+                app, platform, versionId: appVerId || '', outputPath: dir,
+                removeAppStoreUpdateMetadata: process.env.IPA_REMOVE_APP_STORE_UPDATE_METADATA === '1',
+            };
+            let result;
+            try {
+                result = await this.helperRequest('download', downloadRequest, {progress: true});
+            } catch (error) {
+                if (error.code !== 'LICENSE_REQUIRED') throw error;
+                if (app.price > 0) throw new Error(t('paid_not_purchased'));
+                if (process.env.IPA_ALLOW_APP_ACQUIRE !== '1') {
+                    console.log('@@IPA:requires-acquisition');
+                    throw error;
+                }
+                await this.helperRequest('purchase', {app, platform});
+                result = await this.helperRequest('download', downloadRequest, {progress: true});
+            }
+            this.out = result?.download?.DestinationPath || '';
+            if (!this.out) throw new Error(t('appinfo_nodata'));
             console.log(t('file_archived', {out: this.out}));
         } finally {
-            await this.persistCurrentSession().catch(() => {});
-            await fsPromises.rm(this.cache, {recursive: true, force: true}).catch(() => {});
             Store.cleanup?.();
             console.log(t('cleanup_done'));
         }
@@ -437,12 +542,16 @@ export class Ipa {
             const message = error.message || String(error);
             // 用稳定的 error.code 判断商店会话过期（cookie/令牌失效），不依赖文案语言；Apple 英文消息保留兜底。
             const code = error.code;
-            const sessionMayBeExpired = this.usedCachedSession
-                && (code === 'TOKEN_EXPIRED'
-                    || (!code && /Your password has changed\.?|password token is expired|Sign In to the iTunes Store/i.test(message)))
+            const sessionMayBeExpired = (code === 'TOKEN_EXPIRED'
+                || (this.usedCachedSession && !code
+                    && /Your password has changed\.?|password token is expired|Sign In to the iTunes Store/i.test(message)))
                 && !/License not found|已拥有|already|not found/i.test(message);
             if (!sessionMayBeExpired) throw error;
 
+            // Refresh the purchase token with the password already stored by
+            // Pastel. If Apple requires two-factor authentication, Store.login
+            // returns the stable challenge marker and the macOS app asks only
+            // for the six-digit code before retrying this same job.
             console.log(t('relogin'));
             await this.login({force: true});
             const result = await fn();

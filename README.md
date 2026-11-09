@@ -21,7 +21,7 @@
 
 ## 系统要求与下载
 
-- macOS **15.0 或更高版本**；已在 macOS **15.7.3 / M4 Pro** 上进行实际登录和下载验证。
+- macOS **15.0 或更高版本**；本次适配已在 macOS **15.7.3 / M4 Pro** 上通过 Debug/Release 构建和自动测试；实际账户登录与下载仍需重新验证。
 - **Apple 芯片（arm64）实体 Mac**。不提供 Intel 或 Universal 安装包。
 - 已开通 App Store 的 Apple 账户；付费 App 需要该账户已购买。
 
@@ -38,7 +38,8 @@
 - 管理下载资料库，支持在访达中显示、共享与隔空投送。
 - macOS 26 保留 Liquid Glass；macOS 15 使用兼容的材质、按钮和布局。
 - macOS 15 停用可能触发 `TooltipResponder / AttributeGraph` 崩溃的 SwiftUI 悬停提示，保留辅助功能提示。
-- 设备 GUID 在进程内缓存，减少重复钥匙串读取；登录成功需确认加密会话已保存，取消后的旧登录回调不会干扰新登录。
+- 同步上游 20261109 的认证、并发下载和首次免费 App 获取修复，使用固定版本 ipatool 的 StoreHelper；helper 已按 macOS 15 重新构建。
+- 设备 GUID 在进程内缓存并使用上游的文件存储方案；登录成功需确认加密会话已保存，取消后的旧登录回调不会干扰新登录。
 - 下载接口的空 HTTP 403 不再被一律判定为“账户会话失效”，日志保留接口名称、状态码等诊断信息。
 
 账户密码存放在 macOS 钥匙串，会话数据加密保存。更新临时签名的安装包后，钥匙串可能要求重新授权；设备标识、账户密码和会话密钥是不同的条目，可能分别提示。
@@ -47,13 +48,13 @@
 
 历史版本列表有记录，不代表 Apple 仍允许该账户下载该版本。如果同一账户能下载其他 App，却在某个版本上收到空 HTTP 403，请先尝试该 App 的其他版本，不必反复重新登录或重新获取许可。
 
-本次验证中，京东 `16.0.0 / 890808313` 返回空 HTTP 403，其他下载已由用户确认正常。该现象不足以断定版本已下架或账户缺少许可。
-
 报告问题时请附上系统版本、Pastel 版本、App ID、版本 ID 和 `[Store]` 诊断行；不要公开密码、验证码、Token 或 Cookie。
 
 ## 从源码构建
 
-需要 **Xcode 26.2 或更高版本**（macOS 26 SDK）和联网环境。编译 SDK 与最低运行系统不同：生成的 App 最低支持 macOS 15.0。仓库内置 Node.js 24，构建时根据锁文件安装依赖，无需单独安装 Node.js。
+需要 **Xcode 26.2 或更高版本**（macOS 26 SDK）和联网环境。编译 SDK 与最低运行系统不同：生成的 App 最低支持 macOS 15.0。仓库内置 Node.js 24 和 macOS 15 版 store-helper，构建时根据锁文件安装依赖，无需单独安装 Node.js。
+
+修改 `StoreHelper/` 源码或固定依赖后，需要 Go 1.26.5（可由 Go 自动下载工具链），执行 `sh Scripts/BuildStoreHelper.sh` 并提交重新生成的 `node/bin/store-helper.gz`。不能直接使用上游预编译 helper；打包会检查所有内嵌可执行文件的最低系统版本。
 
 ```bash
 open Pastel.xcodeproj
@@ -69,24 +70,30 @@ sh Scripts/BuildAdHocDMG.sh
 
 ## GitHub Releases 自动发布
 
-[Release 工作流](.github/workflows/release.yml) 使用 GitHub 托管的 **macOS 15 ARM** 构建机和 **Xcode 26.2**，只构建一个 arm64 DMG，不需要 Apple 开发者证书或额外的签名 Secrets。工作流使用 GitHub 提供的 `GITHUB_TOKEN` 发布到当前仓库。
+[Release 工作流](.github/workflows/release.yml) 使用 GitHub 托管的 **macOS 26 ARM** 构建机和 **Xcode 26.2**，只构建一个 arm64 DMG，不需要 Apple 开发者证书或额外的签名 Secrets。工作流使用 GitHub 提供的 `GITHUB_TOKEN` 发布到当前仓库。
 
 发布步骤：
 
 1. 同时更新 `Pastel.xcodeproj/project.pbxproj` 中 Debug 和 Release 的 `MARKETING_VERSION`、`CURRENT_PROJECT_VERSION`。
 2. 添加 `release-notes/<版本>/release-notes.md`，提交并推送代码。
-3. 推送 `Pastel<版本>` 标签，自动触发构建、测试和 Release 发布。例如当前版本：
+3. 推送 `Pastel<版本>` 标签，自动触发构建、测试和 Release 发布。例如本次适配版本：
 
 ```bash
-git tag Pastel20261028.1
-git push origin Pastel20261028.1
+git tag Pastel20261109.1
+git push origin Pastel20261109.1
 ```
 
 也可在 Actions 中选择 **Release → Run workflow**，输入已推送的标签。标签必须与代码中的版本匹配；构建或校验失败时不会发布。成功后 Release 只有一个 DMG 附件，SHA-256 校验值写入发布说明。已发布的 Release 不会被自动覆盖。
 
 工作流文件推送到 GitHub 后才生效；首次使用 fork 的 Actions 时，如 GitHub 提示禁用，请先在 Actions 页面启用。
 
+## 维护与同步上游
+
+项目维护规则见 [AGENTS.md](AGENTS.md)。上游最低要求 macOS 26，本 fork 必须保持 macOS 15.0；每次同步都要检查兼容层、认证状态、内嵌二进制和独立更新源。
+
 ## 更新记录
+
+- [20261109.1：同步上游登录与下载修复](release-notes/20261109.1/release-notes.md)
 
 - [20261028.1：macOS 15 适配版与自动发布](release-notes/20261028.1/release-notes.md)
 - `release-notes/` 中较早的版本记录来自原仓库，保留用于追溯上游历史。

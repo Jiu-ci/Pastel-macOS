@@ -8,8 +8,6 @@ import {
     buildLoginBody,
     buildSignedAuthenticationHeaders,
     parseLoginResponse,
-    shouldRetryAuthenticationRequest,
-    shouldRetryWithLegacyAuthenticate,
 } from '../src/gsa.js';
 
 test('recognizes StoreServices HTTP authentication failures', () => {
@@ -96,16 +94,6 @@ test('active Store login path does not invoke GSA or Anisette', () => {
     assert.doesNotMatch(mainSource, /request-2fa|IPA_NATIVE_ANISETTE/);
 });
 
-test('falls back from native authentication statuses used by ipatool', () => {
-    for (const status of [204, 403, 404, 503]) {
-        assert.equal(shouldRetryWithLegacyAuthenticate('https://auth.itunes.apple.com/auth/v1/native/fast/', status), true, String(status));
-    }
-    for (const status of [0, 200, 302, 401, 429, 500]) {
-        assert.equal(shouldRetryWithLegacyAuthenticate('https://auth.itunes.apple.com/auth/v1/native/fast/', status), false, String(status));
-    }
-    assert.equal(shouldRetryWithLegacyAuthenticate('https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate', 403), false);
-});
-
 test('signs the exact Store authentication plist bytes for Apple', () => {
     const body = Buffer.from('<?xml version="1.0"?><plist><string>secret</string></plist>');
     let signedBody;
@@ -162,11 +150,4 @@ test('keeps a rejected verification code actionable instead of reporting token e
 
     assert.equal(result.error?.code, 'AUTH_CODE_REJECTED');
     assert.match(result.error?.message || '', /Apple/);
-});
-
-test('does not wait through native retries when a legacy authentication fallback is available', () => {
-    assert.equal(shouldRetryAuthenticationRequest('https://auth.itunes.apple.com/auth/v1/native/fast/', 204), false);
-    assert.equal(shouldRetryAuthenticationRequest('https://auth.itunes.apple.com/auth/v1/native/fast/', 404), false);
-    assert.equal(shouldRetryAuthenticationRequest('https://auth.itunes.apple.com/auth/v1/native/fast/', 429), true);
-    assert.equal(shouldRetryAuthenticationRequest('https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate', 204), true);
 });

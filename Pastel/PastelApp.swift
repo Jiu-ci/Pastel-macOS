@@ -197,6 +197,7 @@ private struct LegacyStoredCredentials: Codable {
 enum CredentialVaultError: LocalizedError {
     case keychainOperationFailed(String, OSStatus)
     case invalidLegacyKeyData
+    case invalidVaultData
 
     var errorDescription: String? {
         switch self {
@@ -204,6 +205,8 @@ enum CredentialVaultError: LocalizedError {
             return String(localized: "Keychain \(operation) 失败：\(Int(status))")
         case .invalidLegacyKeyData:
             return String(localized: "旧版凭据密钥无效")
+        case .invalidVaultData:
+            return String(localized: "凭据保险库无效或已损坏")
         }
     }
 }
@@ -224,21 +227,47 @@ private enum DeviceGUIDStore {
 
     static func current() throws -> String {
         if let cachedIdentifier { return cachedIdentifier }
-        if let saved = try load() {
+        if let saved = loadFile() {
             cachedIdentifier = saved
             return saved
         }
 
-        guard let value = systemIdentifier() else {
-            throw DeviceGUIDError.unavailable
+        if let value = systemIdentifier() {
+            try saveFile(value)
+            cachedIdentifier = value
+            return value
         }
 
-        try save(value)
-        cachedIdentifier = value
-        return value
+        if let legacy = try loadLegacyKeychain() {
+            try saveFile(legacy)
+            cachedIdentifier = legacy
+            return legacy
+        }
+
+        throw DeviceGUIDError.unavailable
     }
 
-    private static func load() throws -> String? {
+    private static func loadFile() -> String? {
+        guard let data = try? Data(contentsOf: fileURL),
+              let value = String(data: data, encoding: .utf8),
+              let normalized = normalized(value) else {
+            return nil
+        }
+        return normalized
+    }
+
+    private static func saveFile(_ value: String) throws {
+        guard let normalized = normalized(value) else {
+            throw DeviceGUIDError.unavailable
+        }
+        let directory = fileURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        try Data(normalized.utf8).write(to: fileURL, options: [.atomic])
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
+    }
+
+    private static func loadLegacyKeychain() throws -> String? {
         var query = baseQuery
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -269,30 +298,12 @@ private enum DeviceGUIDStore {
         return normalized
     }
 
-    private static func save(_ value: String) throws {
-        guard let normalized = normalized(value) else {
-            throw DeviceGUIDError.unavailable
-        }
-        let data = Data(normalized.utf8)
-        let update: [String: Any] = [
-            kSecValueData as String: data,
-            kSecAttrDescription as String: "Pastel StoreServices Device GUID"
-        ]
-
-        let updateStatus = SecItemUpdate(baseQuery as CFDictionary, update as CFDictionary)
-        if updateStatus == errSecSuccess { return }
-        guard updateStatus == errSecItemNotFound else {
-            throw CredentialVaultError.keychainOperationFailed("更新", updateStatus)
-        }
-
-        var addQuery = baseQuery
-        addQuery[kSecValueData as String] = data
-        addQuery[kSecAttrDescription as String] = "Pastel StoreServices Device GUID"
-        addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-        let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
-        guard addStatus == errSecSuccess else {
-            throw CredentialVaultError.keychainOperationFailed("写入", addStatus)
-        }
+    private static var fileURL: URL {
+        let baseURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support")
+        return baseURL
+            .appendingPathComponent(appDisplayName, isDirectory: true)
+            .appendingPathComponent("device-guid")
     }
 
     private static var baseQuery: [String: Any] {
@@ -405,38 +416,17 @@ private struct StoredCredentialsMetadata: Codable {
     }
 }
 
+private struct PasswordVaultPayload: Codable, Equatable {
+    var passwords: [String: String]
+}
+
+private struct PasswordVaultEnvelope: Codable {
+    let version: Int
+    let sealedData: Data
+}
+
 private enum KeychainPasswordStore {
     private static let service = "com.allenmiao.ipahistorydownload.apple-account-password"
-
-    static func savePassword(_ password: String, for account: StoredAccount) throws {
-        let passwordData = Data(password.utf8)
-        let query = baseQuery(for: account.id)
-        let update: [String: Any] = [
-            kSecValueData as String: passwordData,
-            kSecAttrLabel as String: account.displayLabel,
-            kSecAttrDescription as String: "Pastel Apple account password"
-        ]
-
-        let updateStatus = SecItemUpdate(query as CFDictionary, update as CFDictionary)
-        if updateStatus == errSecSuccess {
-            return
-        }
-
-        guard updateStatus == errSecItemNotFound else {
-            throw CredentialVaultError.keychainOperationFailed("更新", updateStatus)
-        }
-
-        var addQuery = query
-        addQuery[kSecValueData as String] = passwordData
-        addQuery[kSecAttrLabel as String] = account.displayLabel
-        addQuery[kSecAttrDescription as String] = "Pastel Apple account password"
-        addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-
-        let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
-        guard addStatus == errSecSuccess else {
-            throw CredentialVaultError.keychainOperationFailed("写入", addStatus)
-        }
-    }
 
     static func loadPassword(for accountID: UUID) throws -> String {
         var query = baseQuery(for: accountID)
@@ -486,10 +476,19 @@ private enum KeychainPasswordStore {
 }
 
 private enum SessionEncryptionKeyStore {
-    private static let service = "com.allenmiao.ipahistorydownload.session-encryption"
-    private static let account = "NodeSessionStorage"
+    private static let service = "com.allenmiao.ipahistorydownload.credential-vault-master-key"
+    private static let account = "CredentialVaultV1"
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var cachedKey: Data?
 
     static func loadOrCreateKey() throws -> Data {
+        lock.lock()
+        defer { lock.unlock() }
+
+        if let cachedKey {
+            return cachedKey
+        }
+
         var query = baseQuery
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -497,30 +496,69 @@ private enum SessionEncryptionKeyStore {
         var result: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
         if status == errSecSuccess, let data = result as? Data, data.count == 32 {
+            cachedKey = data
             return data
         }
         guard status == errSecItemNotFound || status == errSecSuccess else {
             throw CredentialVaultError.keychainOperationFailed("读取会话密钥", status)
         }
 
-        var bytes = [UInt8](repeating: 0, count: 32)
-        let randomStatus = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
-        guard randomStatus == errSecSuccess else {
-            throw CredentialVaultError.keychainOperationFailed("生成会话密钥", randomStatus)
+        var legacyQuery = legacyBaseQuery
+        legacyQuery[kSecReturnData as String] = true
+        legacyQuery[kSecMatchLimit as String] = kSecMatchLimitOne
+        var legacyResult: CFTypeRef?
+        let legacyStatus = SecItemCopyMatching(legacyQuery as CFDictionary, &legacyResult)
+
+        let data: Data
+        if legacyStatus == errSecSuccess,
+           let legacyData = legacyResult as? Data,
+           legacyData.count == 32 {
+            // Preserve existing encrypted sessions. The copied item is owned by
+            // the stable release signature, so this legacy access happens once.
+            data = legacyData
+        } else {
+            guard legacyStatus == errSecItemNotFound || legacyStatus == errSecSuccess else {
+                throw CredentialVaultError.keychainOperationFailed("读取旧版会话密钥", legacyStatus)
+            }
+            var bytes = [UInt8](repeating: 0, count: 32)
+            let randomStatus = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+            guard randomStatus == errSecSuccess else {
+                throw CredentialVaultError.keychainOperationFailed("生成会话密钥", randomStatus)
+            }
+            data = Data(bytes)
         }
-        let data = Data(bytes)
+
         var addQuery = baseQuery
         addQuery[kSecValueData as String] = data
         addQuery[kSecAttrDescription as String] = "Pastel encrypted Apple session storage key"
         addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
         let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
         if addStatus == errSecDuplicateItem {
-            return try loadOrCreateKey()
+            var retryResult: CFTypeRef?
+            let retryStatus = SecItemCopyMatching(query as CFDictionary, &retryResult)
+            guard retryStatus == errSecSuccess,
+                  let existing = retryResult as? Data,
+                  existing.count == 32 else {
+                throw CredentialVaultError.keychainOperationFailed("读取会话密钥", retryStatus)
+            }
+            cachedKey = existing
+            return existing
         }
         guard addStatus == errSecSuccess else {
             throw CredentialVaultError.keychainOperationFailed("写入会话密钥", addStatus)
         }
+        cachedKey = data
         return data
+    }
+
+    static func deleteKey() throws {
+        lock.lock()
+        defer { lock.unlock() }
+        let status = SecItemDelete(baseQuery as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw CredentialVaultError.keychainOperationFailed("删除会话密钥", status)
+        }
+        cachedKey = nil
     }
 
     private static var baseQuery: [String: Any] {
@@ -530,23 +568,48 @@ private enum SessionEncryptionKeyStore {
             kSecAttrAccount as String: account
         ]
     }
+
+    private static var legacyBaseQuery: [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "com.allenmiao.ipahistorydownload.session-encryption",
+            kSecAttrAccount as String: "NodeSessionStorage"
+        ]
+    }
 }
 
 enum CredentialVault {
+    private static let lock = NSLock()
+    private static let vaultVersion = 1
+    private static let vaultAuthenticationData = Data("PastelCredentialVault:v1".utf8)
+
     static func save(_ credentials: StoredCredentials) throws {
+        lock.lock()
+        defer { lock.unlock() }
         try prepareDirectory()
 
         let normalized = credentials.normalized
+        var passwords = try loadVaultPasswordsIfPresent()
+        var migratedAccountIDs: [UUID] = []
         for account in normalized.accounts {
             if !account.password.isEmpty {
-                try KeychainPasswordStore.savePassword(account.password, for: account)
+                passwords[account.id.uuidString] = account.password
+                migratedAccountIDs.append(account.id)
             }
+        }
+        let validAccountIDs = Set(normalized.accounts.map { $0.id.uuidString })
+        passwords = passwords.filter { validAccountIDs.contains($0.key) }
+        if !passwords.isEmpty || FileManager.default.fileExists(atPath: vaultURL.path) {
+            try saveVaultPasswords(passwords)
         }
 
         let metadata = StoredCredentialsMetadata(normalized)
         let payload = try JSONEncoder().encode(metadata)
         try payload.write(to: metadataURL, options: [.atomic])
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: metadataURL.path)
+        for accountID in migratedAccountIDs {
+            try KeychainPasswordStore.deletePassword(for: accountID)
+        }
         try? deleteLegacyEncryptedFiles()
     }
 
@@ -573,18 +636,45 @@ enum CredentialVault {
     }
 
     static func deleteStoredCredentials() throws {
+        lock.lock()
+        defer { lock.unlock() }
         if FileManager.default.fileExists(atPath: metadataURL.path) {
             try FileManager.default.removeItem(at: metadataURL)
         }
+        if FileManager.default.fileExists(atPath: vaultURL.path) {
+            try FileManager.default.removeItem(at: vaultURL)
+        }
         try KeychainPasswordStore.deleteAllPasswords()
+        try SessionEncryptionKeyStore.deleteKey()
         try? deleteLegacyEncryptedFiles()
     }
 
     static func loadPassword(for accountID: UUID) throws -> String {
-        try KeychainPasswordStore.loadPassword(for: accountID)
+        lock.lock()
+        defer { lock.unlock() }
+
+        var passwords = try loadVaultPasswordsIfPresent()
+        if let password = passwords[accountID.uuidString] {
+            return password
+        }
+
+        let legacyPassword = try KeychainPasswordStore.loadPassword(for: accountID)
+        guard !legacyPassword.isEmpty else { return "" }
+
+        passwords[accountID.uuidString] = legacyPassword
+        try saveVaultPasswords(passwords)
+        try KeychainPasswordStore.deletePassword(for: accountID)
+        return legacyPassword
     }
 
     static func deletePassword(for accountID: UUID) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        if FileManager.default.fileExists(atPath: vaultURL.path) {
+            var passwords = try loadVaultPasswordsIfPresent()
+            passwords.removeValue(forKey: accountID.uuidString)
+            try saveVaultPasswords(passwords)
+        }
         try KeychainPasswordStore.deletePassword(for: accountID)
     }
 
@@ -594,6 +684,10 @@ enum CredentialVault {
 
     private static var metadataURL: URL {
         applicationSupportURL.appendingPathComponent("accounts.json")
+    }
+
+    private static var vaultURL: URL {
+        applicationSupportURL.appendingPathComponent("credentials.vault")
     }
 
     private static var credentialsURL: URL {
@@ -613,6 +707,55 @@ enum CredentialVault {
     private static func prepareDirectory() throws {
         try FileManager.default.createDirectory(at: applicationSupportURL, withIntermediateDirectories: true)
         try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: applicationSupportURL.path)
+    }
+
+    private static func loadVaultPasswordsIfPresent() throws -> [String: String] {
+        guard FileManager.default.fileExists(atPath: vaultURL.path) else { return [:] }
+        let keyData = try SessionEncryptionKeyStore.loadOrCreateKey()
+        return try loadVaultPasswords(using: keyData)
+    }
+
+    private static func loadVaultPasswords(using keyData: Data) throws -> [String: String] {
+        let envelopeData = try Data(contentsOf: vaultURL)
+        let envelope = try JSONDecoder().decode(PasswordVaultEnvelope.self, from: envelopeData)
+        guard envelope.version == vaultVersion else {
+            throw CredentialVaultError.invalidVaultData
+        }
+        let sealedBox = try AES.GCM.SealedBox(combined: envelope.sealedData)
+        let plaintext: Data
+        do {
+            plaintext = try AES.GCM.open(
+                sealedBox,
+                using: SymmetricKey(data: keyData),
+                authenticating: vaultAuthenticationData
+            )
+        } catch {
+            throw CredentialVaultError.invalidVaultData
+        }
+        return try JSONDecoder().decode(PasswordVaultPayload.self, from: plaintext).passwords
+    }
+
+    private static func saveVaultPasswords(_ passwords: [String: String]) throws {
+        try prepareDirectory()
+        let keyData = try SessionEncryptionKeyStore.loadOrCreateKey()
+        let plaintext = try JSONEncoder().encode(PasswordVaultPayload(passwords: passwords))
+        let sealedBox = try AES.GCM.seal(
+            plaintext,
+            using: SymmetricKey(data: keyData),
+            authenticating: vaultAuthenticationData
+        )
+        guard let combined = sealedBox.combined else {
+            throw CredentialVaultError.invalidVaultData
+        }
+        let envelope = PasswordVaultEnvelope(version: vaultVersion, sealedData: combined)
+        let encoded = try JSONEncoder().encode(envelope)
+        try encoded.write(to: vaultURL, options: [.atomic])
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: vaultURL.path)
+
+        let verified = try loadVaultPasswords(using: keyData)
+        guard verified == passwords else {
+            throw CredentialVaultError.invalidVaultData
+        }
     }
 
     private static func loadLegacyEncryptedCredentials() throws -> StoredCredentials? {
@@ -809,6 +952,7 @@ struct RunConfig {
     var validateLogin: Bool = false
     var appIsFree: String = ""
     var appCountry: String = "us"
+    var appPlatform: String = "iphone"
     var allowAppAcquisition: Bool = false
     var removeAppStoreUpdateMetadata: Bool = false
 }
@@ -925,8 +1069,42 @@ private final class IBeamCursorRectView: NSView {
     }
 }
 
+enum StoreOperationPhase: String {
+    case waiting, preparing, authenticating, authorizing, transferring, packaging
+
+    var title: String {
+        switch self {
+        case .waiting: String(localized: "等待认证")
+        case .preparing: String(localized: "准备中")
+        case .authenticating: String(localized: "认证中")
+        case .authorizing: String(localized: "获取许可")
+        case .transferring: String(localized: "连接下载")
+        case .packaging: String(localized: "处理中")
+        }
+    }
+
+    var message: String {
+        switch self {
+        case .waiting: String(localized: "正在等待其他任务完成认证…")
+        case .preparing: String(localized: "首次使用正在准备 Apple 认证组件，可能需要几分钟…")
+        case .authenticating: String(localized: "正在登录并验证 Apple 账户…")
+        case .authorizing: String(localized: "正在获取 App 下载许可…")
+        case .transferring: String(localized: "正在连接下载服务器…")
+        case .packaging: String(localized: "正在处理下载文件…")
+        }
+    }
+
+    static func latest(in log: String) -> Self? {
+        log.split(separator: "\n").reversed().compactMap { line -> StoreOperationPhase? in
+            let prefix = "@@IPA:phase="
+            guard line.hasPrefix(prefix) else { return nil }
+            return Self(rawValue: String(line.dropFirst(prefix.count)))
+        }.first
+    }
+}
+
 func ipaIsVerificationChallenge(_ text: String) -> Bool {
-    return text.contains("[2FA]") || text.contains("[AUTH]")
+    return text.contains("[2FA]")
 }
 
 func ipaProgressValue(from text: String) -> Double? {
@@ -954,11 +1132,18 @@ func downloadErrorMessage(from log: String) -> String {
     }
 
     if ipaIsVerificationChallenge(text) {
-        return String(localized: "Apple 无法区分密码错误与双重认证。请检查密码；如果已收到验证码，也可以直接输入。")
+        return String(localized: "Apple 需要双重认证验证码。请在收到验证码后输入。")
+    }
+    if text.localizedCaseInsensitiveContains("SAP")
+        || text.localizedCaseInsensitiveContains("AppleMediaServices")
+        || text.contains("签名会话") {
+        return String(localized: "无法建立 Apple 登录签名会话。请检查网络后重试；如果问题持续，请更新 Pastel。")
     }
     if text.localizedCaseInsensitiveContains("Your password has changed")
         || text.localizedCaseInsensitiveContains("password token is expired")
-        || text.contains("本地会话可能已失效") {
+        || text.contains("本地会话可能已失效")
+        || text.contains("[AUTH]")
+        || text.contains("@@IPA:auth_required=1") {
         return String(localized: "Apple 账户会话已失效。请重新登录后再试。")
     }
     if text.contains("账号或密码不正确")
@@ -975,7 +1160,12 @@ func downloadErrorMessage(from log: String) -> String {
         || text.localizedCaseInsensitiveContains("unable to connect") {
         return String(localized: "无法连接 Apple 服务器。请检查网络连接后再试。")
     }
-    if text.contains("服务器繁忙") || text.localizedCaseInsensitiveContains("server busy") {
+    if text.contains("服务器繁忙")
+        || text.contains("商店令牌换取失败")
+        || text.contains("Apple 登录服务暂时未返回")
+        || text.localizedCaseInsensitiveContains("server busy")
+        || text.localizedCaseInsensitiveContains("failed to exchange store token")
+        || text.localizedCaseInsensitiveContains("apple sign-in did not return usable store credentials") {
         return String(localized: "Apple 服务器暂时不可用。请稍后再试。")
     }
     if text.contains("获取许可失败")
@@ -1000,6 +1190,7 @@ func downloadRequiresRelogin(from log: String) -> Bool {
         || log.localizedCaseInsensitiveContains("password token is expired")
         || log.contains("本地会话可能已失效")
         || log.contains("[AUTH]")
+        || log.contains("@@IPA:auth_required=1")
 }
 
 private func cleanDownloadErrorDetail(_ line: String) -> String? {
@@ -1119,6 +1310,15 @@ enum SettingsTab: String, CaseIterable, Identifiable {
 
 private let credentialSaveQueue = DispatchQueue(label: "com.allenmiao.ipadownload.credentialsave", qos: .utility)
 
+#if DEBUG
+enum LoginSimulation: String, CaseIterable, Identifiable {
+    case verification = "需要验证码"
+    case ambiguous = "模糊认证失败"
+    case slow = "验证等待中取消"
+    var id: String { rawValue }
+}
+#endif
+
 @MainActor
 @Observable
 final class AccountStore {
@@ -1136,6 +1336,57 @@ final class AccountStore {
     private var pipes: (Pipe, Pipe)?
     private var pending: (email: String, password: String, editingID: UUID?, country: String)?
     private var validationGeneration: UInt64 = 0
+    private var validationLog = ""
+
+    #if DEBUG
+    var loginSimulation: LoginSimulation?
+    private var simulationTask: Task<Void, Never>?
+    private var simulationID = UUID()
+
+    func beginLoginSimulationIfNeeded() {
+        guard loginSimulation != nil else { return }
+        validate(email: "panghu@example.invalid", password: "panghu-simulation-only",
+                 editingID: nil, fallbackCountry: "jp")
+    }
+
+    private func runSimulatedValidation(code: String) {
+        simulationTask?.cancel()
+        let id = UUID()
+        simulationID = id
+        isValidating = true
+        needsCode = !code.isEmpty
+        validationLog = ""
+        let delay: UInt64 = loginSimulation == .slow && !code.isEmpty
+            ? 10_000_000_000 : 700_000_000
+        simulationTask = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: delay) } catch { return }
+            guard let self, self.simulationID == id, !Task.isCancelled else { return }
+            if code.isEmpty {
+                self.validationLog = self.loginSimulation == .ambiguous
+                    ? "[X] [AUTH] 模拟：密码错误或需要双重认证。"
+                    : "[X] [2FA] 模拟：需要验证码。"
+                self.finishValidation(exitCode: 1, generation: self.validationGeneration, log: self.validationLog)
+            } else if code == "123456" {
+                self.finishValidation(exitCode: 0, generation: self.validationGeneration, log: self.validationLog)
+            } else {
+                self.validationLog = code == "999999"
+                    ? "[X] 模拟：验证码已过期，请重新输入。"
+                    : "[X] 模拟：验证码不正确，请重新输入。"
+                self.finishValidation(exitCode: 1, generation: self.validationGeneration, log: self.validationLog)
+            }
+        }
+    }
+    #endif
+
+    var canEnterVerificationCode: Bool {
+        pending != nil && !isValidating && !needsCode && validationLog.contains("[AUTH]")
+    }
+
+    func enterVerificationCode() {
+        guard canEnterVerificationCode else { return }
+        needsCode = true
+        validationMessage = ""
+    }
 
     var selectedAccount: StoredAccount? { accounts.first { $0.id == selectedAccountID } }
     var hasSelectedLogin: Bool {
@@ -1153,6 +1404,20 @@ final class AccountStore {
 
         let password = try CredentialVault.loadPassword(for: account.id)
         if !password.isEmpty {
+            accounts[index].password = password
+        }
+        return password
+    }
+
+    func passwordAsync(for account: StoredAccount) async throws -> String {
+        if let cached = accounts.first(where: { $0.id == account.id })?.password, !cached.isEmpty {
+            return cached
+        }
+        let accountID = account.id
+        let password = try await Task.detached(priority: .userInitiated) {
+            try CredentialVault.loadPassword(for: accountID)
+        }.value
+        if !password.isEmpty, let index = accounts.firstIndex(where: { $0.id == accountID }) {
             accounts[index].password = password
         }
         return password
@@ -1246,14 +1511,19 @@ final class AccountStore {
     func submitCode(_ code: String) {
         guard !isValidating else { return }
         let clean = code.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !clean.isEmpty, pending != nil else { return }
-        needsCode = false
+        guard clean.count == 6, clean.allSatisfy({ $0 >= "0" && $0 <= "9" }),
+              pending != nil, !isValidating else { return }
         validationMessage = String(localized: "正在完成 Apple 账户双重认证…")
         runValidation(code: clean)
     }
 
     func cancelValidation() {
         validationGeneration &+= 1
+        #if DEBUG
+        simulationTask?.cancel()
+        simulationTask = nil
+        simulationID = UUID()
+        #endif
         process?.terminate()
         cleanup()
         isValidating = false
@@ -1266,6 +1536,12 @@ final class AccountStore {
         guard let pending else { return }
         validationGeneration &+= 1
         let generation = validationGeneration
+        #if DEBUG
+        if loginSimulation != nil {
+            runSimulatedValidation(code: code)
+            return
+        }
+        #endif
         let runtime: (projectURL: URL, mainURL: URL, nodeURL: URL)
         let credentialInput: (pipe: Pipe, data: Data)
         let deviceGUID: String
@@ -1281,7 +1557,8 @@ final class AccountStore {
         catch { isValidating = false; validationMessage = error.localizedDescription; return }
 
         isValidating = true
-        needsCode = false
+        needsCode = !code.isEmpty
+        validationLog = ""
 
         let task = Process()
         task.executableURL = runtime.nodeURL
@@ -1307,12 +1584,24 @@ final class AccountStore {
             process = task
             try NodeRuntime.sendCredentialInput(credentialInput.data, through: credentialInput.pipe)
             DispatchQueue.global(qos: .utility).async { [weak self] in
-                let data = output.fileHandleForReading.readDataToEndOfFile()
+                var data = Data()
+                while let chunk = try? output.fileHandleForReading.read(upToCount: 4096), !chunk.isEmpty {
+                    data.append(chunk)
+                    let progressLog = String(decoding: data, as: UTF8.self)
+                        .replacingOccurrences(of: "\r", with: "\n")
+                    Task { @MainActor [weak self] in
+                        guard let self, self.validationGeneration == generation, self.isValidating else { return }
+                        self.validationLog = progressLog
+                        if let phase = StoreOperationPhase.latest(in: progressLog) {
+                            self.validationMessage = phase.message
+                        }
+                    }
+                }
                 task.waitUntilExit()
                 let log = String(decoding: data, as: UTF8.self)
                     .replacingOccurrences(of: "\r", with: "\n")
                 let exitCode = task.terminationStatus
-                Task { @MainActor in
+                Task { @MainActor [weak self] in
                     self?.finishValidation(exitCode: exitCode, generation: generation, log: log)
                 }
             }
@@ -1327,21 +1616,32 @@ final class AccountStore {
 
     private func finishValidation(exitCode: Int32, generation: UInt64, log: String) {
         guard generation == validationGeneration else { return }
+        validationLog = log
         cleanup()
         if exitCode == 0 {
             isValidating = false
             needsCode = false
+            #if DEBUG
+            if loginSimulation != nil {
+                pending = nil
+                validationMessage = ""
+                statusMessage = "模拟验证成功；未保存账户，也未连接 Apple。"
+                saveTick += 1
+                return
+            }
+            #endif
             if saveValidated(from: log) {
                 validationMessage = ""
                 saveTick += 1
             }
         } else if ipaIsVerificationChallenge(log) {
             isValidating = false
+            let wasEnteringCode = needsCode
             needsCode = true
-            validationMessage = validationError(from: log)
+            validationMessage = wasEnteringCode
+                ? validationError(from: log) : ""
         } else {
             isValidating = false
-            needsCode = false
             validationMessage = validationError(from: log)
         }
     }
@@ -1421,7 +1721,9 @@ final class DownloadManager {
         var label: String
         var status: JobStatus = .running
         var log: String = ""
-        var progress: Double? = 0
+        var progress: Double? = nil
+        var phase: StoreOperationPhase?
+        var phaseBuffer = ""
         var isPackaging: Bool = false
         var needsCode: Bool = false
         var awaitingSession: Bool = false
@@ -1433,6 +1735,7 @@ final class DownloadManager {
     private var processes: [String: Process] = [:]
     private var pipes: [String: (Pipe, Pipe)] = [:]
     private var configs: [String: RunConfig] = [:]
+    private var discardedJobIDs: Set<String> = []
 
     var anyRunning: Bool { processes.values.contains(where: \.isRunning) }
     var runningCount: Int { processes.values.count(where: \.isRunning) }
@@ -1491,6 +1794,7 @@ final class DownloadManager {
         env["IPA_DEVICE_GUID"] = deviceGUID
         if !config.appIsFree.isEmpty { env["IPA_APP_IS_FREE"] = config.appIsFree }
         env["IPA_APP_COUNTRY"] = config.appCountry
+        env["IPA_APP_PLATFORM"] = config.appPlatform
         if config.removeAppStoreUpdateMetadata { env["IPA_REMOVE_APP_STORE_UPDATE_METADATA"] = "1" }
         if let sessionURL = Self.sessionDirectoryURL() { env["IPA_SESSION_DIR"] = sessionURL.path }
         task.environment = env
@@ -1566,6 +1870,19 @@ final class DownloadManager {
     func stop(id: String) { processes[id]?.terminate() }
     func stopAll() { processes.values.forEach { $0.terminate() } }
 
+    func discard(id: String) {
+        guard jobs[id] != nil || processes[id] != nil || configs[id] != nil else { return }
+        discardedJobIDs.insert(id)
+        if let process = processes[id], process.isRunning {
+            process.terminate()
+        } else {
+            cleanup(id: id)
+            jobs[id] = nil
+            configs[id] = nil
+            discardedJobIDs.remove(id)
+        }
+    }
+
     func remove(id: String) {
         guard processes[id] == nil else { return }
         jobs[id] = nil; configs[id] = nil
@@ -1575,9 +1892,17 @@ final class DownloadManager {
     }
 
     private func append(id: String, _ text: String) {
+        guard !discardedJobIDs.contains(id) else { return }
         guard var job = jobs[id] else { return }
         let normalized = text.replacingOccurrences(of: "\r", with: "\n")
-        if normalized.contains("@@IPA:phase=packaging") { job.isPackaging = true }
+        job.phaseBuffer += normalized
+        if let end = job.phaseBuffer.lastIndex(of: "\n") {
+            if let phase = StoreOperationPhase.latest(in: String(job.phaseBuffer[...end])) {
+                job.phase = phase
+                job.isPackaging = phase == .packaging
+            }
+            job.phaseBuffer = String(job.phaseBuffer[job.phaseBuffer.index(after: end)...])
+        }
         if normalized.contains("@@IPA:requires-acquisition") { job.needsAcquisition = true }
         let cleaned = normalized
             .split(separator: "\n", omittingEmptySubsequences: false)
@@ -1590,6 +1915,11 @@ final class DownloadManager {
 
     private func finish(id: String, exitCode: Int32) {
         cleanup(id: id)
+        if discardedJobIDs.remove(id) != nil {
+            jobs[id] = nil
+            configs[id] = nil
+            return
+        }
         guard var job = jobs[id] else { return }
         job.progress = nil; job.isPackaging = false
         if exitCode == 0 {
@@ -2161,6 +2491,10 @@ struct ContentView: View {
     @State private var taskFeature = TaskLogFeatureState()
     @State private var pendingAppAcquisition: AppAcquisitionRequest?
     @State private var showingAppAcquisitionPrompt = false
+    @State private var appleVersionRequestID: UUID?
+    @State private var activeAppleVersionJobID: String?
+    @State private var activeAppleVersionAppID = ""
+    @State private var isPreparingAppleVersionFetch = false
     @Namespace private var manualActionGlassNamespace
     @Environment(\.colorScheme) private var colorScheme
     @FocusState private var activeField: ActiveField?
@@ -2173,7 +2507,13 @@ struct ContentView: View {
     @AppStorage(AppLanguage.overrideKey) private var languageOverride = ""
 
     private var versionListLoading: Bool {
-        catalog.isLoadingVersions || downloads.isRunning(Self.versionIDsFetchJobKey)
+        catalog.isLoadingVersions || isPreparingAppleVersionFetch
+            || activeAppleVersionJobID.map(downloads.isRunning) == true
+    }
+
+    private var activeAppleVersionJobStatus: JobStatus? {
+        guard let activeAppleVersionJobID else { return nil }
+        return downloads.job(activeAppleVersionJobID)?.status
     }
 
     private var centeredSpinner: some View {
@@ -2285,11 +2625,20 @@ struct ContentView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             refreshDownloadedFiles()
         }
-        .onChange(of: downloads.job(Self.versionIDsFetchJobKey)?.status) { _, status in
-            guard let job = downloads.job(Self.versionIDsFetchJobKey) else { return }
+        .onChange(of: activeAppleVersionJobStatus) { _, status in
+            guard let jobID = activeAppleVersionJobID,
+                  let job = downloads.job(jobID) else { return }
             if status == .done || (status == .failed && !job.needsCode) {
-                parseFetchedVersionIDs(from: job.log)
-                downloads.remove(id: Self.versionIDsFetchJobKey)
+                let belongsToActiveApp = activeAppleVersionAppID == activeAppID
+                if belongsToActiveApp {
+                    parseFetchedVersionIDs(from: job.log)
+                }
+                activeAppleVersionJobID = nil
+                activeAppleVersionAppID = ""
+                downloads.remove(id: jobID)
+                if belongsToActiveApp && status == .failed && downloadRequiresRelogin(from: job.log) {
+                    showRelogin()
+                }
             }
         }
         .alert(String(localized: "登录"), isPresented: $accountFeature.showingVerificationPrompt) {
@@ -2307,7 +2656,7 @@ struct ContentView: View {
                 accountFeature.pendingCodeJobID = nil
             }
         } message: {
-            Text(String(localized: "Apple 无法区分密码错误与双重认证。请检查密码；如果已收到验证码，也可以直接输入。"))
+            Text(String(localized: "Apple 需要双重认证验证码。请在收到验证码后输入。"))
         }
         .alert(
             String(localized: "需要获取 App"),
@@ -2331,11 +2680,6 @@ struct ContentView: View {
     private var adaptiveMainToolbar: some ToolbarContent {
         ToolbarItem(placement: .principal) {
             floatingModeBar
-        }
-        .pastelHiddenSharedBackground()
-
-        ToolbarItem(placement: .primaryAction) {
-            toolbarStarButton
         }
         .pastelHiddenSharedBackground()
 
@@ -2366,22 +2710,6 @@ struct ContentView: View {
         .pastelHelp(String(localized: "设置"))
     }
 
-    private var toolbarStarButton: some View {
-        Button {
-            openProjectPage()
-        } label: {
-            Image(systemName: "star.fill")
-                .font(.system(size: 14, weight: .regular))
-                .foregroundStyle(.yellow)
-                .frame(width: 35, height: 35)
-                .contentShape(Circle())
-                .pastelGlassEffect(in: Circle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("GitHub Star")
-        .pastelHelp("GitHub Star")
-    }
-
     private func showSettings() {
         openWindow(id: "settings")
     }
@@ -2389,12 +2717,6 @@ struct ContentView: View {
     private func showRelogin() {
         accountStore.requestRelogin()
         showSettings()
-    }
-
-    private func openProjectPage() {
-        if let url = URL(string: projectURL) {
-            NSWorkspace.shared.open(url)
-        }
     }
 
     private var floatingModeBar: some View {
@@ -3034,6 +3356,7 @@ struct ContentView: View {
                                             isDownloading: downloads.isRunning(jobID),
                                             downloadProgress: downloads.job(jobID)?.progress,
                                             isPackaging: downloads.job(jobID)?.isPackaging ?? false,
+                                            downloadPhase: downloads.job(jobID)?.phase,
                                             hasError: downloads.job(jobID)?.status == .failed,
                                             errorLog: downloads.job(jobID)?.log ?? "",
                                             downloadedURL: downloadedURL,
@@ -3220,7 +3543,7 @@ struct ContentView: View {
                 signIn: showRelogin
             )
         case .running:
-            DownloadProgressPill(progress: manualDownloadJob?.progress, isPackaging: manualDownloadJob?.isPackaging ?? false)
+            DownloadProgressPill(progress: manualDownloadJob?.progress, isPackaging: manualDownloadJob?.isPackaging ?? false, phase: manualDownloadJob?.phase)
                 .pastelGlassEffectID("manual-download-action", in: manualActionGlassNamespace)
         case .downloaded:
             FileActionsBar(
@@ -3361,6 +3684,7 @@ struct ContentView: View {
 
     private func selectHistoryProvider(_ provider: String) {
         guard catalog.historyProvider != provider else { return }
+        cancelAppleVersionFetch()
         withAnimation(.snappy(duration: 0.18)) {
             catalog.historyProvider = provider
         }
@@ -3595,6 +3919,7 @@ struct ContentView: View {
                                     isDownloading: downloads.isRunning(jobID),
                                     downloadProgress: downloads.job(jobID)?.progress,
                                     isPackaging: downloads.job(jobID)?.isPackaging ?? false,
+                                            downloadPhase: downloads.job(jobID)?.phase,
                                     hasError: downloads.job(jobID)?.status == .failed,
                                     errorLog: downloads.job(jobID)?.log ?? "",
                                     downloadedURL: downloadedURL,
@@ -4762,6 +5087,7 @@ struct ContentView: View {
     }
 
     private func clearActiveAppSelectionForPlatformChange() {
+        cancelAppleVersionFetch()
         searchFeature.selectedApp = nil
         searchFeature.selectedAppLocalIconPath = nil
         versionFeature.selectedVersion = nil
@@ -4828,6 +5154,7 @@ struct ContentView: View {
     }
 
     private func selectApp(_ result: AppSearchResult) {
+        cancelAppleVersionFetch()
         searchFeature.selectedApp = result
         searchFeature.selectedAppLocalIconPath = nil
         versionFeature.selectedVersion = nil
@@ -5138,8 +5465,6 @@ struct ContentView: View {
         refreshDownloadedFiles()
     }
 
-    private static let versionIDsFetchJobKey = "__ipa_versionids_fetch__"
-
     private nonisolated static func filenameVersionAndVariant(from stem: String) -> (name: String, version: String, variant: IPADownloadVariant) {
         let suffix = "_no-update"
         let variant: IPADownloadVariant
@@ -5168,18 +5493,17 @@ struct ContentView: View {
             return
         }
         let acct = account.appleAccount.trimmingCharacters(in: .whitespacesAndNewlines)
-        let pwd: String
-        do {
-            pwd = try accountStore.password(for: account)
-        } catch {
-            accountFeature.saveMessage = error.localizedDescription
-            return
-        }
         let appID = activeAppID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !acct.isEmpty, !pwd.isEmpty else {
+        guard !acct.isEmpty else {
             accountFeature.saveMessage = String(localized: "请先登录 Apple 账户。"); showSettings(); return
         }
         guard !appID.isEmpty else { return }
+        cancelAppleVersionFetch()
+        let requestID = UUID()
+        let jobID = "__ipa_versionids_fetch__\(requestID.uuidString)"
+        appleVersionRequestID = requestID
+        activeAppleVersionAppID = appID
+        isPreparingAppleVersionFetch = true
         versionFeature.selectedVersion = nil
         versionFeature.selectedVersionIDs.removeAll()
         versionFeature.lastSelectedVersionID = nil
@@ -5189,11 +5513,49 @@ struct ContentView: View {
         catalog.versionStatus = String(localized: "正在从 Apple 获取版本…")
         let accountCountry = account.countryCode.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let priceFlag = accountCountry.caseInsensitiveCompare(selectedCountryCode) == .orderedSame ? appIsFreeFlag() : ""
-        let config = RunConfig(appleAccount: acct, password: pwd, code: "",
-                               appID: appID, versionID: "", downloadDir: "", listVersionIDs: true,
-                               appIsFree: priceFlag, appCountry: accountCountry.isEmpty ? selectedCountryCode : accountCountry,
-                               allowAppAcquisition: allowAppAcquisition)
-        downloads.start(id: Self.versionIDsFetchJobKey, label: String(localized: "获取版本列表"), config: config)
+        Task {
+            do {
+                try await Task.sleep(nanoseconds: 180_000_000)
+                guard appleVersionRequestID == requestID,
+                      activeAppID == appID,
+                      catalog.historyProvider == "apple" || activeAppIsVision else { return }
+                let pwd = try await accountStore.passwordAsync(for: account)
+                guard appleVersionRequestID == requestID,
+                      activeAppID == appID,
+                      catalog.historyProvider == "apple" || activeAppIsVision else { return }
+                guard !pwd.isEmpty else {
+                    isPreparingAppleVersionFetch = false
+                    accountFeature.saveMessage = String(localized: "请先登录 Apple 账户。")
+                    catalog.versionStatus = String(localized: "Apple 账户会话已失效。请重新登录后再试。")
+                    showRelogin()
+                    return
+                }
+                let config = RunConfig(appleAccount: acct, password: pwd, code: "",
+                                       appID: appID, versionID: "", downloadDir: "", listVersionIDs: true,
+                                       appIsFree: priceFlag, appCountry: accountCountry.isEmpty ? selectedCountryCode : accountCountry,
+                                       appPlatform: selectedSearchPlatform.rawValue,
+                                       allowAppAcquisition: allowAppAcquisition)
+                isPreparingAppleVersionFetch = false
+                activeAppleVersionJobID = jobID
+                downloads.start(id: jobID, label: String(localized: "获取版本列表"), config: config)
+            } catch {
+                guard appleVersionRequestID == requestID else { return }
+                isPreparingAppleVersionFetch = false
+                accountFeature.saveMessage = error.localizedDescription
+                catalog.versionStatus = error.localizedDescription
+                showRelogin()
+            }
+        }
+    }
+
+    private func cancelAppleVersionFetch() {
+        appleVersionRequestID = nil
+        isPreparingAppleVersionFetch = false
+        activeAppleVersionAppID = ""
+        if let jobID = activeAppleVersionJobID {
+            activeAppleVersionJobID = nil
+            downloads.discard(id: jobID)
+        }
     }
 
     private func appIsFreeFlag() -> String {
@@ -5451,7 +5813,7 @@ struct ContentView: View {
             version: version,
             versionId: str("softwareVersionExternalIdentifier"),
             sizeBytes: size,
-            appleAccount: str("appleId"),
+            appleAccount: IPAMetadata.appleAccount(in: plist),
             storefrontId: str("s"),
             downloadDate: date,
             removesAppStoreUpdates: metadataInfo.removesAppStoreUpdates || filenameInfo.variant.removesAppStoreUpdates,
@@ -5721,6 +6083,7 @@ struct ContentView: View {
             fetchVersionIDsFromApple()
             return
         }
+        cancelAppleVersionFetch()
         catalog.loadVersions()
     }
 
@@ -5789,6 +6152,7 @@ struct ContentView: View {
             downloadDir: cleanDir,
             appIsFree: priceFlag,
             appCountry: accountCountry.isEmpty ? selectedCountryCode : accountCountry,
+            appPlatform: selectedSearchPlatform.rawValue,
             removeAppStoreUpdateMetadata: removeUpdateMetadata
         )
         let variant = IPADownloadVariant(removeAppStoreUpdateMetadata: removeUpdateMetadata)
@@ -6102,6 +6466,7 @@ struct RetryingAsyncImage<Content: View, Placeholder: View>: View {
 struct DownloadProgressPill: View {
     let progress: Double?
     var isPackaging: Bool = false
+    var phase: StoreOperationPhase?
 
     private var normalizedProgress: Double {
         min(max(progress ?? 0, 0), 1)
@@ -6154,7 +6519,10 @@ struct DownloadProgressPill: View {
                 .font(.caption.weight(.semibold))
                 .monospacedDigit()
         } else {
-            Text(String(localized: "下载中"))
+            Text(phase?.title ?? String(localized: "下载中"))
+                .lineLimit(1)
+                .minimumScaleFactor(0.65)
+                .pastelHelp(phase?.message ?? String(localized: "下载中"))
                 .foregroundStyle(foregroundStyle)
                 .font(.caption.weight(.semibold))
                 .monospacedDigit()
@@ -6590,6 +6958,9 @@ struct AccountSettingsView: View {
     @State private var editor: AccountEditorContext?
     @State private var accountPendingDeletion: StoredAccount?
     @State private var deviceGUID: String?
+    #if DEBUG
+    @State private var loginSimulation: LoginSimulation?
+    #endif
 
     var body: some View {
         SettingsContentPane(tab: .account) {
@@ -6614,6 +6985,14 @@ struct AccountSettingsView: View {
                     .pastelHelp(String(localized: "添加账户"))
 
                     Spacer(minLength: 0)
+                    #if DEBUG
+                    Menu("登录流程测试") {
+                        ForEach(LoginSimulation.allCases) { scenario in
+                            Button(scenario.rawValue) { loginSimulation = scenario }
+                        }
+                    }
+                    .pastelHelp("仅 Debug：使用隔离的模拟账户，不连接 Apple。")
+                    #endif
                 }
 
                 SettingsGroupBox {
@@ -6641,7 +7020,7 @@ struct AccountSettingsView: View {
                     VStack(alignment: .leading, spacing: 3) {
                         Text(String(localized: "本地凭据保护"))
                             .font(.callout.weight(.semibold))
-                        Text(String(localized: "Apple 账户密码存储在 macOS Keychain 中，本机只保存账户名称和地区等非敏感设置。"))
+                        Text(String(localized: "Apple 账户密码使用 Keychain 中的主密钥进行 AES-GCM 加密；本机仅保存加密保险库和非敏感设置。"))
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -6649,7 +7028,7 @@ struct AccountSettingsView: View {
 
                     Spacer()
 
-                    Label(String(localized: "使用 Keychain 保护"), systemImage: "lock.shield")
+                    Label(String(localized: "Keychain 与 AES-GCM 保护"), systemImage: "lock.shield")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
@@ -6666,6 +7045,11 @@ struct AccountSettingsView: View {
             AccountEditorView(context: context)
                 .environment(accountStore)
         }
+        #if DEBUG
+        .sheet(item: $loginSimulation) { scenario in
+            LoginSimulationView(scenario: scenario)
+        }
+        #endif
         .confirmationDialog(
             String(localized: "确认删除这个 Apple 账户？"),
             isPresented: Binding(
@@ -6693,6 +7077,26 @@ struct AccountSettingsView: View {
         editor = .relogin(account)
     }
 }
+
+#if DEBUG
+private struct LoginSimulationView: View {
+    let scenario: LoginSimulation
+    @State private var store: AccountStore
+
+    init(scenario: LoginSimulation) {
+        self.scenario = scenario
+        let store = AccountStore()
+        store.loginSimulation = scenario
+        self.store = store
+    }
+
+    var body: some View {
+        AccountEditorView(context: .new)
+            .environment(store)
+            .onDisappear { store.cancelValidation() }
+    }
+}
+#endif
 
 private struct SettingsDeviceGUIDRow: View {
     let deviceGUID: String?
@@ -6891,7 +7295,6 @@ struct AccountEditorView: View {
 
     @State private var email = ""
     @State private var password = ""
-    @State private var code = ""
 
     private var editingID: UUID? { context.account?.id }
     private var canSubmit: Bool {
@@ -6899,11 +7302,20 @@ struct AccountEditorView: View {
     }
 
     var body: some View {
+        @Bindable var accountStore = accountStore
         VStack(alignment: .leading, spacing: 18) {
             Text(context.isRelogin
                  ? String(localized: "登录") + " · " + (context.account?.displayLabel ?? "")
                  : (editingID == nil ? String(localized: "添加 Apple 账户") : String(localized: "编辑 Apple 账户")))
                 .font(.title3.weight(.semibold))
+
+            #if DEBUG
+            if accountStore.loginSimulation != nil {
+                Text("登录模拟 · 不连接 Apple，不保存账户\n123456：成功；000000：错误；999999：过期")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+            }
+            #endif
 
             VStack(spacing: 0) {
                 AccountEditorInputRow(title: String(localized: "Apple 账户"),
@@ -6919,30 +7331,14 @@ struct AccountEditorView: View {
                                       text: $password)
             }
             .modifier(AccountEditorBoxStyle())
+            .disabled(accountStore.needsCode || accountStore.isValidating)
 
-            if accountStore.needsCode {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(String(localized: "Apple 无法区分密码错误与双重认证。请检查密码；如果已收到验证码，也可以直接输入。"))
-                        .font(.callout.weight(.semibold))
-                        .fixedSize(horizontal: false, vertical: true)
+            Text(String(localized: "保存前会先登录验证，并在需要时要求双重认证验证码。"))
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
 
-                    VStack(spacing: 0) {
-                        AccountEditorInputRow(title: String(localized: "验证码"),
-                                              prompt: String(localized: "验证码"),
-                                              kind: .code,
-                                              text: $code,
-                                              onSubmit: { accountStore.submitCode(code) })
-                    }
-                    .modifier(AccountEditorBoxStyle())
-                }
-            } else {
-                Text(String(localized: "保存前会先登录验证，并在需要时要求双重认证验证码。"))
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            if accountStore.isValidating {
+            if accountStore.isValidating && !accountStore.needsCode {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.small)
                     Text(accountStore.validationMessage.isEmpty ? String(localized: "正在验证…") : accountStore.validationMessage)
@@ -6957,39 +7353,45 @@ struct AccountEditorView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            HStack {
+            if accountStore.canEnterVerificationCode {
+                Button(String(localized: "已收到验证码？输入验证码")) {
+                    accountStore.enterVerificationCode()
+                }
+                .buttonStyle(.link)
+            }
+
+            HStack(spacing: 12) {
                 Spacer()
                 Button(String(localized: "取消")) {
                     accountStore.cancelValidation()
                     dismiss()
                 }
-                if accountStore.needsCode {
-                    Button(String(localized: "登录")) {
-                        code = ""
-                        accountStore.validate(email: email, password: password,
-                                              editingID: editingID, fallbackCountry: selectedCountryCode)
-                    }
-                    .disabled(!canSubmit || accountStore.isValidating)
-                    Button(String(localized: "继续")) { accountStore.submitCode(code) }
-                        .buttonStyle(.borderedProminent)
-                        .keyboardShortcut(.defaultAction)
-                        .disabled(code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                } else {
-                    Button(context.isRelogin ? String(localized: "登录") : String(localized: "保存")) {
-                        accountStore.validate(email: email, password: password,
-                                              editingID: editingID, fallbackCountry: selectedCountryCode)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(!canSubmit || accountStore.isValidating)
+                Button(context.isRelogin ? String(localized: "登录") : String(localized: "保存")) {
+                    accountStore.validate(email: email, password: password,
+                                          editingID: editingID, fallbackCountry: selectedCountryCode)
                 }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+                .disabled(!canSubmit || accountStore.isValidating || accountStore.needsCode)
             }
         }
         .padding(24)
         .frame(width: 520)
+        .sheet(isPresented: $accountStore.needsCode) {
+            AccountVerificationView()
+                .environment(accountStore)
+                .interactiveDismissDisabled()
+        }
         .onAppear {
             accountStore.validationMessage = ""
             accountStore.needsCode = false
+            #if DEBUG
+            if accountStore.loginSimulation != nil {
+                email = "test@example.invalid"
+                password = "simulation-only"
+                accountStore.beginLoginSimulationIfNeeded()
+            }
+            #endif
             if let account = context.account {
                 email = account.appleAccount
                 password = account.password
@@ -6999,6 +7401,68 @@ struct AccountEditorView: View {
             }
         }
         .onChange(of: accountStore.saveTick) { _, _ in dismiss() }
+    }
+}
+
+struct AccountVerificationView: View {
+    @Environment(AccountStore.self) private var accountStore
+    @Environment(\.dismiss) private var dismiss
+    @State private var code = ""
+    @FocusState private var codeFocused: Bool
+
+    private var canSubmit: Bool {
+        let clean = code.trimmingCharacters(in: .whitespacesAndNewlines)
+        return clean.count == 6 && clean.allSatisfy { $0 >= "0" && $0 <= "9" }
+            && !accountStore.isValidating
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text(String(localized: "双重认证"))
+                .font(.title3.weight(.semibold))
+            #if DEBUG
+            if accountStore.loginSimulation != nil {
+                Text("模拟验证码：123456 成功，000000 错误，999999 过期。")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+            }
+            #endif
+            Text(String(localized: "请输入 Apple 双重认证的六位验证码。"))
+                .fixedSize(horizontal: false, vertical: true)
+            TextField(String(localized: "验证码"), text: $code)
+                .textContentType(.oneTimeCode)
+                .textFieldStyle(.roundedBorder)
+                .focused($codeFocused)
+                .disabled(accountStore.isValidating)
+                .onSubmit { if canSubmit { accountStore.submitCode(code) } }
+            if accountStore.isValidating {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text(String(localized: "正在完成 Apple 账户双重认证…"))
+                        .font(.caption)
+                }
+            } else if !accountStore.validationMessage.isEmpty {
+                Text(accountStore.validationMessage)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack(spacing: 12) {
+                Spacer()
+                Button(String(localized: "取消")) {
+                    accountStore.cancelValidation()
+                    dismiss()
+                }
+                .keyboardShortcut(.cancelAction)
+                Button(String(localized: "确认")) { accountStore.submitCode(code) }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!canSubmit)
+            }
+        }
+        .padding(24)
+        .frame(width: 420)
+        .defaultFocus($codeFocused, true)
     }
 }
 

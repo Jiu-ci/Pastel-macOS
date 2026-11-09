@@ -10,6 +10,10 @@ output_dir=${PASTEL_OUTPUT_DIR:-"${project_root}/dist"}
 
 export DEVELOPER_DIR="$developer_dir"
 
+# Local distribution requires no Apple Developer membership or certificate.
+# Retain an opt-in identity for users who have configured one.
+release_identity=${PASTEL_SIGNING_IDENTITY:--}
+
 sh "${project_root}/Scripts/VerifyDeviceGUIDImplementation.sh" \
     "${project_root}/Pastel/PastelApp.swift"
 
@@ -18,12 +22,16 @@ xcodebuild \
     -scheme Pastel \
     -configuration Release \
     -derivedDataPath "$derived_data" \
-    CODE_SIGNING_ALLOWED=YES \
+    CODE_SIGN_STYLE=Manual \
+    CODE_SIGN_IDENTITY="$release_identity" \
+    DEVELOPMENT_TEAM= \
+    CODE_SIGNING_ALLOWED=NO \
     build
 
 app="${derived_data}/Build/Products/Release/Pastel.app"
 node="${app}/Contents/Resources/node/bin/node"
 signer="${app}/Contents/Resources/sap-signer"
+store_helper="${app}/Contents/Resources/store-helper"
 
 test -d "$app"
 # Test the bundled code and dependencies, even on a clean CI checkout with no
@@ -40,8 +48,20 @@ test -d "$app"
 )
 test "$(/usr/bin/lipo -archs "${app}/Contents/MacOS/Pastel")" = "arm64"
 test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "${app}/Contents/Info.plist")" = "15.0"
+python3 "${project_root}/Scripts/VerifyMacOSCompatibility.py" \
+    "${app}/Contents/MacOS/Pastel" "$node" "$signer" "$store_helper"
+# Apply local ad-hoc signatures required by Apple silicon, with no developer
+# certificate. Keep this order: leaf executables, then the app.
+codesign --force --sign "$release_identity" "$signer"
+codesign --force --sign "$release_identity" --options runtime \
+    --entitlements "${project_root}/Scripts/NodeJIT.entitlements" "$node"
+codesign --force --sign "$release_identity" --options runtime \
+    --entitlements "${project_root}/Scripts/StoreHelper.entitlements" "$store_helper"
+codesign --force --sign "$release_identity" "$app"
+
 codesign --verify --strict "$signer"
 codesign --verify --strict "$node"
+codesign --verify --strict "$store_helper"
 codesign --verify --deep --strict "$app"
 
 # Validate Node after every enclosing signature has been applied. Merely checking
